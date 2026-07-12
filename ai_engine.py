@@ -1,12 +1,13 @@
 import os
 import json
 import re
+import io
+import pandas as pd
 from google import genai
-from google.genai import types as genai_types  # Aliased to eliminate Pylance collision with standard 'types'
+from google.genai import types as genai_types
 from core_parser import load_all_registries
 from dotenv import load_dotenv
 
-# 1. Securely load environmental memory keys
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -16,30 +17,43 @@ if not API_KEY:
 client = genai.Client(api_key=API_KEY)
 
 
+def clean_binary_csv_local(filename):
+    """Executes the mandatory 5-step binary parsing protocol on local reference registries."""
+    if not os.path.exists(filename):
+        return pd.DataFrame()
+    raw_bytes = open(filename, 'rb').read()
+    bom_index = raw_bytes.find(b'\xef\xbb\xbf')
+    if bom_index != -1:
+        cleaned_bytes = raw_bytes[bom_index:]
+        text_stream = cleaned_bytes.decode('utf-8')
+    else:
+        text_stream = raw_bytes.decode('utf-8', errors='ignore')
+    df = pd.read_csv(io.StringIO(text_stream))
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+
 def clean_json_text(text):
-    """
-    Safely removes markdown wraps if present. Uses explicit string replaces 
-    to eliminate backtick serialization collisions during code deployments.
-    """
+    """Safely removes markdown tag fences from the output payload stream."""
     clean = text.strip()
-    # Masking out markdown tags safely
-    if clean.startswith("xxx".replace('x', '\x60')):
-        clean = clean.replace("xxxjson".replace('x', '\x60'), "")
-        clean = clean.replace("xxx".replace('x', '\x60'), "")
+    markdown_fence_mask = "\x60\x60\x60"
+    if clean.startswith(markdown_fence_mask):
+        clean = re.sub(r'^' + markdown_fence_mask + r'(?:json)?\s*', '', clean)
+        clean = re.sub(r'\s*' + markdown_fence_mask + r'$', '', clean)
     return clean.strip()
 
 
-## Define the Standalone Single-Document Extraction Schema using Explicit genai_types
+## Define the Standalone Single-Document Ingestion Schema with Safe Arrays
 DATA_SCHEMA = genai_types.Schema(
     type=genai_types.Type.OBJECT,
     properties={
-        # Standalone File Operational Trackers
+        # Standalone File Structural Identifiers
         "parent_proposal_number": genai_types.Schema(type=genai_types.Type.STRING, description="Format: YY-XXXX Unique Anchor Key"),
         "sponsor_award_number": genai_types.Schema(type=genai_types.Type.STRING),
-        "modification_number": genai_types.Schema(type=genai_types.Type.STRING, description="The identifier of this specific document, e.g., Base Award, Mod 01, Amendment 2, NCE"),
-        "document_execution_date": genai_types.Schema(type=genai_types.Type.STRING, description="The formal signature or execution date of this specific file in YYYY-MM-DD format"),
+        "modification_number": genai_types.Schema(type=genai_types.Type.STRING, description="e.g., Base Award, Mod 01, Amendment 2, NCE"),
+        "document_execution_date": genai_types.Schema(type=genai_types.Type.STRING, description="The signature or execution date in YYYY-MM-DD format"),
         
-        # Core Contract Attributes Stated in this Specific Document
+        # Core Contract Attributes Stated on the Page Face
         "award_name": genai_types.Schema(type=genai_types.Type.STRING, description="Format: [Funder Acronym. Sponsor Award Number. Award Acronym. Lead PI Family Name]"),
         "primary_sponsor": genai_types.Schema(type=genai_types.Type.STRING, description="Legal agreement partner validated against Sponsors.csv"),
         "start_date": genai_types.Schema(type=genai_types.Type.STRING, description="YYYY-MM-DD"),
@@ -47,40 +61,53 @@ DATA_SCHEMA = genai_types.Schema(
         "principal_investigator": genai_types.Schema(type=genai_types.Type.STRING, description="Lead PI name aligned with Investigators.csv"),
         "award_owning_organization": genai_types.Schema(type=genai_types.Type.STRING, description="Format: XXXXX-Department Name from Rice University Orgs.csv"),
         
-        "award_purpose": genai_types.Schema(type=genai_types.Type.STRING, enum=["Research", "Instruction", "Training", "Public Service", "Construction", "Student Aid", "Agency Funds"]),
-        "award_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["Federal Gov", "State/Local Gov", "State/Local Gov - Fed Prime", "Business", "Business - Fed Prime", "Non-Profit Org", "Non-Profit Org - Fed Prime", "Non-Profit Org - State/Local Prime", "Higher Ed", "Higher Ed - Fed Prime"]),
-        "bill_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["CRM", "CRO", "CRQ", "CRY", "FBM", "FBO", "FBQ", "FBY", "SCHM", "SCHO", "SCHP", "SCHQ", "SCHY"]),
-        "flow_through_sponsor": genai_types.Schema(type=genai_types.Type.STRING, enum=["Yes", "No"]),
+        # System Enums Bound to Destination Oracle/Grants Module Constraints
+        "award_purpose": genai_types.Schema(type=genai_types.Type.STRING, enum=["Research", "Instruction", "Training", "Public Service", "Construction", "Student Aid", "Agency Funds", "Other", "Undetermined"]),
+        "award_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["Federal Gov", "State/Local Gov", "State/Local Gov - Fed Prime", "Business", "Business - Fed Prime", "Non-Profit Org", "Non-Profit Org - Fed Prime", "Non-Profit Org - State/Local Prime", "Higher Ed", "Higher Ed - Fed Prime", "Other", "Undetermined"]),
+        "bill_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["CRM", "CRO", "CRQ", "CRY", "FBM", "FBO", "FBQ", "FBY", "SCHM", "SCHO", "SCHP", "SCHQ", "SCHY", "Other", "Undetermined"]),
+        "flow_through_sponsor": genai_types.Schema(type=genai_types.Type.STRING, enum=["Yes", "No", "Other", "Undetermined"]),
         "originating_sponsor_and_prime_num": genai_types.Schema(type=genai_types.Type.STRING, description="Format: [Funder Name/Agency Acronym]: [Prime Award Number]"),
-        "aln_number": genai_types.Schema(type=genai_types.Type.STRING, description="Format: XX.XXX"),
+        "aln_number": genai_types.Schema(type=genai_types.Type.STRING, description="Format: XX.XXX Code"),
         "fa_rate": genai_types.Schema(type=genai_types.Type.STRING, description="Numerical percentage and base, e.g., 61% MTDC"),
         "close_date_days": genai_types.Schema(type=genai_types.Type.STRING, description="Number of closeout days as a string envelope, e.g., '90'"),
-        "funding_mechanism": genai_types.Schema(type=genai_types.Type.STRING, enum=["Contract", "Cooperative Agreement", "Grant", "OTA"]),
+        "funding_mechanism": genai_types.Schema(type=genai_types.Type.STRING, enum=["Contract", "Cooperative Agreement", "Grant", "OTA", "Other", "Undetermined"]),
         
-        "subject_to_terms_and_conditions": genai_types.Schema(type=genai_types.Type.STRING, description="Continuous flat string of terms stated in this document, separated by semicolons"),
-        "category_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["Applied Research", "Basic Research", "Experimental Development", "Non Research"]),
-        "far_clauses": genai_types.Schema(type=genai_types.Type.STRING, description="Continuous flat string of FAR clauses stated in this document, separated by semicolons"),
+        "subject_to_terms_and_conditions": genai_types.Schema(
+            type=genai_types.Type.ARRAY, 
+            items=genai_types.Schema(type=genai_types.Type.STRING),
+            description="List of all applicable regulatory terms selected from the protocol instructions"
+        ),
+        "category_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["Applied Research", "Basic Research", "Experimental Development", "Non Research", "Other", "Undetermined"]),
+        
+        "far_clauses": genai_types.Schema(
+            type=genai_types.Type.ARRAY, 
+            items=genai_types.Schema(type=genai_types.Type.STRING),
+            description="List of all applicable FAR clauses selected from the protocol instructions"
+        ),
         
         "field_of_science_fos": genai_types.Schema(type=genai_types.Type.STRING, description="Extracted categories totaling 100%"),
         "special_interest_si": genai_types.Schema(type=genai_types.Type.STRING),
         "special_interest_thecb": genai_types.Schema(type=genai_types.Type.STRING),
         "subject_to_single_audit": genai_types.Schema(type=genai_types.Type.STRING),
         
-        # Standalone Financial Changes Introduced by *This Specific File*
-        "direct_funding_delta": genai_types.Schema(type=genai_types.Type.STRING, description="The incremental change (+/-) in direct funding introduced by this individual file"),
-        "indirect_funding_delta": genai_types.Schema(type=genai_types.Type.STRING, description="The incremental change (+/-) in indirect funding introduced by this individual file"),
-        "total_funding_delta": genai_types.Schema(type=genai_types.Type.STRING, description="The total incremental change introduced by this individual file (Use '0.0' for No-Cost Extensions)"),
+        # Standalone Financial Balances
+        "direct_funding_delta": genai_types.Schema(type=genai_types.Type.STRING),
+        "indirect_funding_delta": genai_types.Schema(type=genai_types.Type.STRING),
+        "total_funding_delta": genai_types.Schema(type=genai_types.Type.STRING),
         
-        # Multi-Dimensional Sub-Arrays Stated in *This Standalone File*
+        # Overall Maximum Awarded Cumulative Ceiling Stated on Notice Page face
+        "total_awarded_ceiling": genai_types.Schema(type=genai_types.Type.STRING),
+        
+        # Multi-Dimensional Arrays
         "deliverables": genai_types.Schema(
             type=genai_types.Type.ARRAY,
             items=genai_types.Schema(
                 type=genai_types.Type.OBJECT,
                 properties={
                     "name": genai_types.Schema(type=genai_types.Type.STRING),
-                    "report_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["Quarterly", "Semi-Annual", "Annual", "Final"]),
-                    "due_date": genai_types.Schema(type=genai_types.Type.STRING, description="YYYY-MM-DD"),
-                    "description": genai_types.Schema(type=genai_types.Type.STRING, description="Max 200 character summary")
+                    "report_type": genai_types.Schema(type=genai_types.Type.STRING, enum=["Quarterly", "Semi-Annual", "Annual", "Final", "Other", "Undetermined"]),
+                    "due_date": genai_types.Schema(type=genai_types.Type.STRING),
+                    "description": genai_types.Schema(type=genai_types.Type.STRING)
                 },
                 required=["name", "report_type", "due_date", "description"]
             )
@@ -90,10 +117,10 @@ DATA_SCHEMA = genai_types.Schema(
             items=genai_types.Schema(
                 type=genai_types.Type.OBJECT,
                 properties={
-                    "period": genai_types.Schema(type=genai_types.Type.STRING, description="e.g., Year 1, Year 2"),
+                    "period": genai_types.Schema(type=genai_types.Type.STRING),
                     "investigator": genai_types.Schema(type=genai_types.Type.STRING),
-                    "category": genai_types.Schema(type=genai_types.Type.STRING, enum=["Equipment", "F&A Cost", "Fringe Benefits", "Other Direct Costs", "Salaries & Wages", "Subawards", "Travel", "Tuition Remission"]),
-                    "amount": genai_types.Schema(type=genai_types.Type.STRING, description="monetary string value envelope")
+                    "category": genai_types.Schema(type=genai_types.Type.STRING, enum=["Equipment", "F&A Cost", "Fringe Benefits", "Other Direct Costs", "Salaries & Wages", "Subawards", "Travel", "Tuition Remission", "Other", "Undetermined"]),
+                    "amount": genai_types.Schema(type=genai_types.Type.STRING)
                 },
                 required=["period", "investigator", "category", "amount"]
             )
@@ -102,46 +129,46 @@ DATA_SCHEMA = genai_types.Schema(
     required=["parent_proposal_number", "sponsor_award_number", "modification_number", "document_execution_date", "total_funding_delta"]
 )
 
+
 def extract_award_data(pdf_path, protocol_path="1.71.md"):
-    """Processes a single contract document with standalone structural layout stability."""
+    """Ingests behavior registries and runs standalone document mapping serialization passes."""
     if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"Target document not found at: {pdf_path}")
-    if not os.path.exists(protocol_path):
-        raise FileNotFoundError(f"Mandatory protocol ruleset missing at: {protocol_path}")
+        raise FileNotFoundError(f"Target document missing: {pdf_path}")
         
-    print(f"Ingesting standalone extraction constraints from {protocol_path}...")
     with open(protocol_path, "r", encoding="utf-8") as f:
         raw_rules = f.read()
-        
-    split_marker = "Final Output Styling & Layout Architecture"
-    system_instruction_rules = raw_rules.split(split_marker)[0] if split_marker in raw_rules else raw_rules
+    system_instruction_rules = raw_rules.split("Final Output Styling & Layout Architecture")[0] if "Final Output Styling & Layout Architecture" in raw_rules else raw_rules
 
     system_instruction_rules += (
         "\n\nSINGLE-FILE EXTRACTION FOCUS: You are analyzing ONE individual contract document from a timeline history. "
-        "Extract only the financial deltas, target dates, and deliverables introduced specifically by this single attached file. "
-        "All monetary values, efforts, and numbers must be output as standard double-quoted text strings."
+        "Extract only the financial deltas, overall stated awarded ceiling, target dates, and deliverables introduced specifically by this single attached file.\n"
+        "HIGH-RIGOR CERTAINTY PROTOCOL: Cross-reference the extracted 'aln_number' hierarchically against the provided ALN PROGRAM HIERARCHY dataset. "
+        "Use the specific sub-program numerical codes to confidently resolve 'award_purpose' and 'category_type' strings based on federal agency mandates. "
+        "If the ALN code or text indicators are ambiguous, missing, or unstated, you are ORDERED to select the 'Other' or 'Undetermined' enum choice. "
+        "Do not guess or leave fields empty.\n"
+        "CRITICAL JSON STRING FORMATTING RULE: Every string field value must be a single continuous line of text. "
+        "Do NOT output raw literal line breaks or physical newlines inside any string value. "
+        "Semicolon-separate internal items on a single line. Escape inner double quotes as \\\" or convert them to single quotes."
     )
 
     sponsors_df, investigators_df, orgs_df = load_all_registries(data_folder="data")
+    aln_hierarchy_df = clean_binary_csv_local("aln_hierarchy.csv")
     
-    print(f"Uploading file via modern Files API: {os.path.basename(pdf_path)}...")
     uploaded_file = client.files.upload(file=pdf_path)
     
     reference_payload = f"""
     Process the attached standalone document according to Protocol 1.71 single-file extraction constraints.
     Cross-reference your extraction strings programmatically against the literal text entries provided below.
-    
     --- REFERENCE REGISTER: SPONSORS ---
     {sponsors_df.to_csv(index=False)}
-    
     --- REFERENCE REGISTER: INVESTIGATORS ---
     {investigators_df.to_csv(index=False)}
-    
     --- REFERENCE REGISTER: RICE ORGS ---
     {orgs_df.to_csv(index=False)}
+    --- REFERENCE REGISTER: ALN PROGRAM HIERARCHY ---
+    {aln_hierarchy_df.to_csv(index=False) if not aln_hierarchy_df.empty else 'No local ALN program csv registry currently staged on disk.'}
     """
     
-    print("🤖 Querying gemini-2.5-flash with structured schema controls...")
     response = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=[uploaded_file, reference_payload],
@@ -153,11 +180,40 @@ def extract_award_data(pdf_path, protocol_path="1.71.md"):
             max_output_tokens=8192
         ),
     )
-    
     client.files.delete(name=uploaded_file.name)
     
     cleaned_json_str = clean_json_text(response.text)
+    
+    # ──────────────────────────────────────────────────────────────────
+    # TWO-PASS AUTO-REPAIR GATEWAY ARCHITECTURE
+    # ──────────────────────────────────────────────────────────────────
     try:
         return json.loads(cleaned_json_str)
-    except json.JSONDecodeError:
-        return json.loads(cleaned_json_str, strict=False)
+    except json.JSONDecodeError as decode_error:
+        print(f"⚠️ Formatting anomaly detected ({decode_error.msg}). Activating automated AI auto-repair gateway...")
+        try:
+            repair_prompt = f"""
+            The following structured JSON payload possesses a formatting or text-boundary defect (such as an unterminated string quote, an unescaped character, or a missing trailing bracket) that prevents standard JSON parsers from initializing it.
+            
+            Review the payload string text, isolate the syntax fracture, and output a completely pristine, flawless version of the identical JSON data structure. 
+            Do NOT truncate the data, summarize fields, or delete items from arrays. Keep all extracted information fully intact, but ensure all string fields are valid single lines.
+            
+            Return ONLY the clean raw JSON text payload without markdown fences.
+            
+            --- MALFORMED JSON PAYLOAD ---
+            {cleaned_json_str}
+            """
+            repair_response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=repair_prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction="You are an expert JSON lint repair utility. Output pure, valid JSON code strings only.",
+                    response_mime_type="application/json",
+                    temperature=0.1
+                )
+            )
+            repaired_text = clean_json_text(repair_response.text)
+            return json.loads(repaired_text)
+        except Exception as repair_failure:
+            print(f"❌ Auto-repair gateway exhausted: {repair_failure}")
+            raise decode_error

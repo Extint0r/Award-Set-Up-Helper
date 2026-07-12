@@ -38,7 +38,6 @@ def fetch_all_sheets_data(spreadsheet_id):
         spreadsheet = client.open_by_key(spreadsheet_id)
         
         data_frames = {}
-        # 🌟 EXTENDED: Added Document_Ledger to the live data stream pull
         tabs = ["Awards_Review", "Document_Ledger", "Deliverables_Detail", "Budget_Ledger", "Labor_Distribution", "Subaward_Budgets"]
         for tab in tabs:
             try:
@@ -99,17 +98,18 @@ st.markdown("---")
 
 data_pools = fetch_all_sheets_data(TARGET_SPREADSHEET_ID)
 
+# 🌟 MODIFIED: Brought lookups outside the conditional gate to protect scannability
+st.subheader("Portfolio Cross-Reference Lookup")
+search_query = st.text_input(
+    "Search records instantly by System UID, Parent Proposal (Cayuse), or Oracle ID:",
+    placeholder="Enter identification token string..."
+).strip().lower()
+
 if data_pools and not data_pools["Awards_Review"].empty:
     df_awards = data_pools["Awards_Review"]
     
     if "selected_uid" not in st.session_state:
         st.session_state.selected_uid = df_awards.iloc[0]['System UID']
-    
-    st.subheader("Portfolio Cross-Reference Lookup")
-    search_query = st.text_input(
-        "Search records instantly by System UID, Parent Proposal (Cayuse), or Oracle ID:",
-        placeholder="Enter identification token string..."
-    ).strip().lower()
     
     if search_query:
         matched_rows = df_awards[
@@ -123,7 +123,7 @@ if data_pools and not data_pools["Awards_Review"].empty:
     if matched_rows.empty:
         st.warning("No records discovered matching that search attribute.")
     else:
-        # 🌟 DEFENSIVE GUARD: Automatically inject missing columns if the Google Sheet has old Row 1 headers
+        # DEFENSIVE GUARD: Automatically inject missing columns if the Google Sheet has old Row 1 headers
         required_audit_columns = {
             "Date Alignment Status": "NOT_IN_SYNC",
             "Reconciliation Action Flag": "Review Divergence",
@@ -131,6 +131,7 @@ if data_pools and not data_pools["Awards_Review"].empty:
             "Federal Oracle Delta": 0.0,
             "Audited Judgment Verdict": "Pending System Sync",
             "Evidentiary Justification": "Run ingestion pipeline with clean sheet tabs.",
+            "Discrepancy Summary": "No structural discrepancies logged.",
             "Sponsor (Cayuse)": "Not Found",
             "Sponsor (Oracle)": "Not Found",
             "Sponsor (SAM.gov)": "Not Found",
@@ -150,7 +151,6 @@ if data_pools and not data_pools["Awards_Review"].empty:
         # ──────────────────────────────────────────────────────────────────
         st.markdown("<div class='section-header'>### Contract Directory Panel</div>", unsafe_allow_html=True)
         
-        # Line 134 safe slice execution path
         list_display_df = matched_rows[[
             "Oracle Award Number",
             "Parent Proposal Number",
@@ -235,7 +235,6 @@ if data_pools and not data_pools["Awards_Review"].empty:
 
         # Relational Sub-Table Data Views
         with st.expander("View Complete Relational Data Sheets", expanded=True):
-            # 🌟 EXTENDED: Added "Compliance & Audited Judgments" to the tabs menu layout
             tab_profile, tab_ledger, tab_labor, tab_subawards, tab_compliance = st.tabs([
                 "General Profile", "Master Budget Ledger", "Labor Distribution", "Subrecipients", "Compliance & Audited Judgments"
             ])
@@ -246,7 +245,6 @@ if data_pools and not data_pools["Awards_Review"].empty:
                 p2.write(f"**Award Owning Org:** {row['Award Owning Organization']}")
                 p3.write(f"**Sponsor Award Number:** `{row['Sponsor Award Number']}`")
                 
-                # 🌟 DISPLAY EXTENDED TRIPLE-NAME MATRIX SPONSOR ATTRIBUTES
                 st.markdown("---")
                 st.markdown("**Triple-Name Sponsor Integration Matrix:**")
                 s1, s2, s3 = st.columns(3)
@@ -284,9 +282,6 @@ if data_pools and not data_pools["Awards_Review"].empty:
                 else:
                     st.info("No active subrecipient institutional lines logged.")
 
-            # ──────────────────────────────────────────────────────────────
-            # 🌟 NEW TAB: COMPLIANCE & AUDITED JUDGMENTS INTERFACE
-            # ──────────────────────────────────────────────────────────────
             with tab_compliance:
                 st.markdown("#### Chronological Document Ledger (Stated PDF Truth)")
                 df_docs = data_pools["Document_Ledger"]
@@ -299,7 +294,6 @@ if data_pools and not data_pools["Awards_Review"].empty:
                 st.markdown("<br>", unsafe_allow_html=True)
                 st.markdown("#### Independent Forensic AI Audited Judgment")
                 
-                # Render the final defensible textual variables inside clean alert blocks
                 st.markdown(f"""
                 <div class='judgment-box'>
                     <b>⚖️ Audited Verdict Declaration:</b><br>{row['Audited Judgment Verdict']}
