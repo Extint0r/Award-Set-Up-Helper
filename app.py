@@ -18,8 +18,11 @@ st.markdown("""
     <style>
     .metric-card { background-color: #f8f9fa; border-left: 5px solid #002b49; padding: 15px; border-radius: 5px; margin-bottom: 10px; }
     .status-badge { background-color: #e3f2fd; color: #0d47a1; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .sync-badge-green { background-color: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .sync-badge-red { background-color: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
     .alert-badge { background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 5px; border: 1px solid #ffeeba; font-family: monospace; }
     .section-header { color: #002b49; border-bottom: 2px solid #002b49; padding-bottom: 5px; margin-top: 25px; margin-bottom: 15px; }
+    .judgment-box { background-color: #e8f4fd; border-left: 5px solid #2196f3; padding: 15px; border-radius: 5px; margin-top: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -35,7 +38,8 @@ def fetch_all_sheets_data(spreadsheet_id):
         spreadsheet = client.open_by_key(spreadsheet_id)
         
         data_frames = {}
-        tabs = ["Awards_Review", "Deliverables_Detail", "Budget_Ledger", "Labor_Distribution", "Subaward_Budgets"]
+        # 🌟 EXTENDED: Added Document_Ledger to the live data stream pull
+        tabs = ["Awards_Review", "Document_Ledger", "Deliverables_Detail", "Budget_Ledger", "Labor_Distribution", "Subaward_Budgets"]
         for tab in tabs:
             try:
                 worksheet = spreadsheet.worksheet(tab)
@@ -52,10 +56,9 @@ def fetch_all_sheets_data(spreadsheet_id):
 # SIDEBAR CONTROL CONSOLE
 with st.sidebar:
     st.title("Rice Contract Reviewer")
-    st.markdown("")
+    st.markdown("Database Processing Control Console")
     st.markdown("---")
     
-    # Section A: File Staging Ingestion Vault
     st.subheader("Staging Vault Upload")
     uploaded_files = st.file_uploader(
         "Upload contract PDF notices or amendment modifications:",
@@ -80,7 +83,6 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # Section B: Core Engine Execution Trigger
     st.subheader("Processing Engine")
     if st.button("Run Ingestion Pipeline", width="stretch"):
         with st.spinner("Processing documents under Protocol 1.71 constraints..."):
@@ -95,24 +97,20 @@ with st.sidebar:
 st.title("Cayuse-Oracle Award Review Dashboard")
 st.markdown("---")
 
-# Sync relational data layers from cloud spreadsheet
 data_pools = fetch_all_sheets_data(TARGET_SPREADSHEET_ID)
 
 if data_pools and not data_pools["Awards_Review"].empty:
     df_awards = data_pools["Awards_Review"]
     
-    # Initialize Persistent Selected Identifier Pointer
     if "selected_uid" not in st.session_state:
         st.session_state.selected_uid = df_awards.iloc[0]['System UID']
     
-    # SYSTEM INTERFACE PORTFOLIO LOOKUP BAR
-    st.subheader("System Cross-Reference Lookup")
+    st.subheader("Portfolio Cross-Reference Lookup")
     search_query = st.text_input(
-        "Search records instantly by Generated Database UID, Parent Proposal Number (Cayuse Project), or Oracle ID (Award Number):",
+        "Search records instantly by System UID, Parent Proposal (Cayuse), or Oracle ID:",
         placeholder="Enter identification token string..."
     ).strip().lower()
     
-    # Comprehensive triple-attribute lookup matching
     if search_query:
         matched_rows = df_awards[
             df_awards['System UID'].astype(str).str.lower().str.contains(search_query) |
@@ -122,69 +120,81 @@ if data_pools and not data_pools["Awards_Review"].empty:
     else:
         matched_rows = df_awards
 
-    # Present Filtered Queue
     if matched_rows.empty:
         st.warning("No records discovered matching that search attribute.")
     else:
+        # 🌟 DEFENSIVE GUARD: Automatically inject missing columns if the Google Sheet has old Row 1 headers
+        required_audit_columns = {
+            "Date Alignment Status": "NOT_IN_SYNC",
+            "Reconciliation Action Flag": "Review Divergence",
+            "Internal Budget Delta": 0.0,
+            "Federal Oracle Delta": 0.0,
+            "Audited Judgment Verdict": "Pending System Sync",
+            "Evidentiary Justification": "Run ingestion pipeline with clean sheet tabs.",
+            "Sponsor (Cayuse)": "Not Found",
+            "Sponsor (Oracle)": "Not Found",
+            "Sponsor (SAM.gov)": "Not Found",
+            "Sponsor UEI": "N/A"
+        }
+        
+        for col_name, default_value in required_audit_columns.items():
+            if col_name not in matched_rows.columns:
+                matched_rows[col_name] = default_value
+
         # Guardrail: If search parameters isolate out the current selection, shift safely onto first available row
         if st.session_state.selected_uid not in matched_rows['System UID'].values:
             st.session_state.selected_uid = matched_rows.iloc[0]['System UID']
 
         # ──────────────────────────────────────────────────────────────────
-        # PANEL 1: SYSTEM DIRECTORY PROMPT MATRIX (PERMANENT TOP SECTION)
+        # PANEL 1: SYSTEM DIRECTORY PROMPT MATRIX
         # ──────────────────────────────────────────────────────────────────
         st.markdown("<div class='section-header'>### Contract Directory Panel</div>", unsafe_allow_html=True)
-        st.caption("Click the selection circle next to any row below to instantly call its data layers into the profile card below.")
         
-        # Slice down to the exact requested five-attribute display matrix
+        # Line 134 safe slice execution path
         list_display_df = matched_rows[[
             "Oracle Award Number",
             "Parent Proposal Number",
             "End Date",
             "Total Stated Awarded Budget",
-            "Total Funding Obligated",
-            "System UID" # Passed in background for selection tracking
+            "Date Alignment Status",      
+            "Reconciliation Action Flag",  
+            "System UID"
         ]].copy()
         
-        # Formally rename column variables to deployment standard names
         list_display_df.columns = [
             "Award Number (Oracle)",
             "Project Number (Cayuse)",
             "Award End Date",
             "Total Awarded Budget",
-            "Total Obligated Budget",
+            "Sync Status",
+            "Workflow Action Owner",
             "System UID"
         ]
         
-        # Render clean interactive grid layout using a persistent state storage key
         st.dataframe(
             list_display_df,
             width="stretch",
             hide_index=True,
             selection_mode="single-row",
-            key="directory_grid", # 🌟 FIXED: Added stable state synchronization key
+            key="directory_grid",
             on_select="rerun",
             column_config={
                 "Total Awarded Budget": st.column_config.NumberColumn(format="$%,d"),
-                "Total Obligated Budget": st.column_config.NumberColumn(format="$%,d"),
-                "System UID": None # Keeps background relation key hidden from user view
+                "System UID": None
             }
         )
         
-        # Intercept persistent memory selections before rendering downstream components
         if "directory_grid" in st.session_state and st.session_state.directory_grid.get("selection", {}).get("rows"):
             clicked_row_pos = st.session_state.directory_grid["selection"]["rows"][0]
             if clicked_row_pos < len(list_display_df):
-                # Update absolute identification token state on the fly
                 st.session_state.selected_uid = list_display_df.iloc[clicked_row_pos]["System UID"]
 
         # ──────────────────────────────────────────────────────────────────
-        # PANEL 2: FOCUSED CONTRACT ANALYSIS CARD (PERMANENT BOTTOM SECTION)
+        # PANEL 2: FOCUSED CONTRACT ANALYSIS CARD
         # ──────────────────────────────────────────────────────────────────
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("<div class='section-header'>### Focused Analysis Profile Card</div>", unsafe_allow_html=True)
         
-        # Double-check guardrail to ensure the active selection is contained in currently filtered matched rows
         if st.session_state.selected_uid in matched_rows['System UID'].values:
             row = matched_rows[matched_rows['System UID'] == st.session_state.selected_uid].iloc[0]
         else:
@@ -197,59 +207,58 @@ if data_pools and not data_pools["Awards_Review"].empty:
         
         st.markdown(f"#### Profile Target: {row['Award Name']}")
         
-        # Identification Parameters Grid
+        # Upper Identification Parameters Grid
         col1, col2, col3, col4 = st.columns(4)
         col1.markdown(f"**System UID:** `{uid}`")
         col2.markdown(f"**Parent Proposal (Cayuse):** `{cayuse_id}`")
         col3.markdown(f"**Oracle Award ID:** `{oracle_id if oracle_id else 'TBD'}`")
-        col4.markdown(f"**Review Status:** <span class='status-badge'>{row['Review Status']}</span>", unsafe_allow_html=True)
         
-        # Financial Double-Entry Accounting Metrics Grid
+        # Color code the triage sync status badges
+        sync_html = f"<span class='sync-badge-green'>In Sync</span>" if row['Date Alignment Status'] == "IN_SYNC" else f"<span class='sync-badge-red'>Out of Sync ({row['Reconciliation Action Flag']})</span>"
+        col4.markdown(f"**Audit Alignment:** {sync_html}", unsafe_allow_html=True)
+        
+        # Lower Financial Metrics Grid
         st.markdown("<br>", unsafe_allow_html=True)
         m1, m2, m3, m4 = st.columns(4)
         with m1:
-            st.metric(label="Total Obligated Funding", value=f"${row['Total Funding Obligated']:,}")
+            st.metric(label="Total Obligated Funding (PDF)", value=f"${row['Total Funding Obligated']:,}")
         with m2:
-            st.metric(label="Total Stated Awarded Budget", value=f"${row['Total Stated Awarded Budget']:,}")
+            st.metric(label="Total Stated Awarded Budget (PDF)", value=f"${row['Total Stated Awarded Budget']:,}")
         with m3:
-            st.metric(label="Direct Cost (Obligated)", value=f"${row['Direct Funding Obligated']:,}")
+            st.metric(label="Internal Budget Delta (Cayuse vs Oracle)", value=f"${row['Internal Budget Delta']:,}")
         with m4:
-            st.metric(label="Indirect Cost (Obligated)", value=f"${row['Indirect Funding Obligated']:,}")
+            st.metric(label="Federal Oracle Delta (USA vs Oracle)", value=f"${row['Federal Oracle Delta']:,}")
             
-        # Programmatic Balance Sheet Discrepancy Callout
         if str(row['Discrepancy Summary']).strip() and str(row['Discrepancy Summary']).lower() != "not found":
             st.markdown(f"<div class='alert-badge'><b>System Audit Notice:</b><br>{row['Discrepancy Summary']}</div>", unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
 
         # Relational Sub-Table Data Views
         with st.expander("View Complete Relational Data Sheets", expanded=True):
-            tab_profile, tab_deliverables, tab_ledger, tab_labor, tab_subawards = st.tabs([
-                "General Profile", "Tracking Deliverables", "Master Budget Ledger", "Labor Distribution", "Subrecipients"
+            # 🌟 EXTENDED: Added "Compliance & Audited Judgments" to the tabs menu layout
+            tab_profile, tab_ledger, tab_labor, tab_subawards, tab_compliance = st.tabs([
+                "General Profile", "Master Budget Ledger", "Labor Distribution", "Subrecipients", "Compliance & Audited Judgments"
             ])
             
             with tab_profile:
                 p1, p2, p3 = st.columns(3)
                 p1.write(f"**Principal Investigator:** {row['Principal Investigator']}")
-                p2.write(f"**Sponsor:** {row['Primary Sponsor']}")
-                p3.write(f"**Award Owning Org:** {row['Award Owning Organization']}")
+                p2.write(f"**Award Owning Org:** {row['Award Owning Organization']}")
+                p3.write(f"**Sponsor Award Number:** `{row['Sponsor Award Number']}`")
                 
+                # 🌟 DISPLAY EXTENDED TRIPLE-NAME MATRIX SPONSOR ATTRIBUTES
+                st.markdown("---")
+                st.markdown("**Triple-Name Sponsor Integration Matrix:**")
+                s1, s2, s3 = st.columns(3)
+                s1.write(f"**Sponsor Name (Cayuse):** {row['Sponsor (Cayuse)']}")
+                s2.write(f"**Sponsor Name (Oracle):** {row['Sponsor (Oracle)']}")
+                s3.write(f"**Sponsor Name (SAM.gov):** {row['Sponsor (SAM.gov)']} `({row['Sponsor UEI']})`")
+                st.markdown("---")
+
                 p4, p5, p6 = st.columns(3)
                 p4.write(f"**Project Start Date:** {row['Start Date']}")
                 p5.write(f"**Project End Date:** {row['End Date']}")
-                p6.write(f"**Sponsor Award Number:** `{row['Sponsor Award Number']}`")
-                
-                p7, p8, p9 = st.columns(3)
-                p7.write(f"**Award Purpose:** {row['Award Purpose']}")
-                p8.write(f"**Category Type:** {row['Award Type']}")
-                p9.write(f"**Billing Method:** {row['Bill Type']}")
-
-            with tab_deliverables:
-                df_deliv = data_pools["Deliverables_Detail"]
-                if not df_deliv.empty and 'System UID' in df_deliv.columns:
-                    matched_deliv = df_deliv[df_deliv['System UID'] == uid].drop(columns=['System UID', 'Parent Proposal Number'], errors='ignore')
-                    st.dataframe(matched_deliv, width="stretch", hide_index=True)
-                else:
-                    st.info("No tracking milestones logged for this award lineage.")
+                p6.write(f"**Billing Method:** {row['Bill Type']}")
 
             with tab_ledger:
                 df_ledge = data_pools["Budget_Ledger"]
@@ -274,6 +283,32 @@ if data_pools and not data_pools["Awards_Review"].empty:
                     st.dataframe(matched_sub, width="stretch", hide_index=True)
                 else:
                     st.info("No active subrecipient institutional lines logged.")
+
+            # ──────────────────────────────────────────────────────────────
+            # 🌟 NEW TAB: COMPLIANCE & AUDITED JUDGMENTS INTERFACE
+            # ──────────────────────────────────────────────────────────────
+            with tab_compliance:
+                st.markdown("#### Chronological Document Ledger (Stated PDF Truth)")
+                df_docs = data_pools["Document_Ledger"]
+                if not df_docs.empty and 'System UID' in df_docs.columns:
+                    matched_docs = df_docs[df_docs['System UID'] == uid].drop(columns=['System UID', 'Parent Proposal Number'], errors='ignore')
+                    st.dataframe(matched_docs, width="stretch", hide_index=True)
+                else:
+                    st.info("No historical document entries tracked for this portfolio transaction packet.")
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("#### Independent Forensic AI Audited Judgment")
+                
+                # Render the final defensible textual variables inside clean alert blocks
+                st.markdown(f"""
+                <div class='judgment-box'>
+                    <b>⚖️ Audited Verdict Declaration:</b><br>{row['Audited Judgment Verdict']}
+                </div>
+                <div class='metric-card' style='margin-top: 15px;'>
+                    <b>🔍 Forensic Evidentiary Rationale:</b><br>{row['Evidentiary Justification']}
+                </div>
+                """, unsafe_allow_html=True)
+
         st.markdown("---")
 else:
     st.info("The application portfolio database is currently unpopulated. Stage award timeline files in the control panel to initialize the reviewer screen.")
