@@ -90,7 +90,10 @@ def parse_mixed_date(date_val):
 
 
 def load_master_reconciliation_registry(csv_path):
-    """Ingests the 5000+ line master reference registry into memory cache."""
+    """
+    Ingests the master fact sheet lookup.
+    🌟 PRESERVED LAYOUT: Automatically formats raw integers into canonical YY-XXXX format.
+    """
     registry_cache = {}
     if not os.path.exists(csv_path):
         print(f"⚠️ Critical Halt: Required master baseline lookup file '{csv_path}' missing.")
@@ -121,7 +124,7 @@ def load_master_reconciliation_registry(csv_path):
 
 
 def calculate_three_way_reconciliation(registry_row, extracted_json):
-    """Executes multi-system delta matrix matching equations."""
+    """Executes multi-system delta matrix matching equations based on final accumulated state machine metrics."""
     oracle_end = parse_mixed_date(registry_row.get("ORACLE_END_DATE", "N/A"))
     cayuse_end = parse_mixed_date(registry_row.get("CAYUSE_END_DATE", "N/A"))
     extracted_pdf_end = parse_mixed_date(extracted_json.get("end_date", "N/A"))
@@ -225,7 +228,7 @@ def log_administrative_error(filepath, error_type, detail_message):
 
 
 def group_files_by_proposal(directory):
-    """Clusters physical intake directory components by tracking ID handles."""
+    """Clusters physical intake directory components strictly preserving the YY-XXXX layout token."""
     packet_groups = defaultdict(list)
     search_pattern = os.path.join(directory, "*.pdf")
     all_files = glob.glob(search_pattern)
@@ -353,8 +356,9 @@ def process_stateful_pipeline():
         for key in metadata_keys:
             synthesized_json[key] = base_record.get(key, "Not Found")
 
+        # 🌟 STATE-MACHINE AGGREGATION ENGINE
         cum_obligated_total = 0.0
-        latest_stated_ceiling = 0.0
+        active_ceiling_envelope = 0.0
         
         final_start_date = "N/A"
         final_end_date = "N/A"
@@ -370,18 +374,30 @@ def process_stateful_pipeline():
             exec_date = parse_mixed_date(doc.get("document_execution_date", "N/A"))
             mod_num = doc.get("modification_number", f"Mod {idx}" if idx > 0 else "Base Award")
             
+            # 📈 1. Obligated Accumulator Math
             delta_tot = safe_float(doc.get("total_funding_delta"))
             cum_obligated_total += delta_tot
 
-            if doc.get("total_awarded_ceiling") and str(doc["total_awarded_ceiling"]).lower() != "n/a":
-                latest_stated_ceiling = safe_float(doc["total_awarded_ceiling"])
+            # 🎪 2. Ceiling Envelope Inheritance Machine
+            stated_ceiling = doc.get("total_awarded_ceiling")
+            if stated_ceiling and str(stated_ceiling).strip().lower() != "n/a" and str(stated_ceiling).strip().lower() != "not stated":
+                current_ceiling_num = safe_float(stated_ceiling)
+                if current_ceiling_num > 0:
+                    active_ceiling_envelope = current_ceiling_num
+            
+            display_ceiling = f"[Inherited: ${active_ceiling_envelope:,.2f}]" if (not stated_ceiling or str(stated_ceiling).strip().lower() in ["n/a", "not stated"]) and active_ceiling_envelope > 0 else f"${active_ceiling_envelope:,.2f}"
 
+            # 📅 3. Date Boundary Inheritance Machine
             if doc.get("start_date") and final_start_date == "N/A":
                 final_start_date = parse_mixed_date(doc["start_date"])
-            if doc.get("end_date") and doc["end_date"] != "N/A":
-                final_end_date = parse_mixed_date(doc["end_date"])
+                
+            stated_end_date = doc.get("end_date")
+            if stated_end_date and str(stated_end_date).strip().lower() != "n/a" and str(stated_end_date).strip().lower() != "not stated":
+                final_end_date = parse_mixed_date(stated_end_date)
+            
+            display_end_date = f"[Inherited: {final_end_date}]" if (not stated_end_date or str(stated_end_date).strip().lower() in ["n/a", "not stated"]) and final_end_date != "N/A" else final_end_date
 
-            # 🌟 ARRAY-SAFE LOGIC CONVERSION FOR TERMS AND CONDITIONS
+            # Array safety mappings for terms and FAR elements
             terms_val = doc.get("subject_to_terms_and_conditions", "")
             if isinstance(terms_val, list):
                 for t in terms_val:
@@ -390,7 +406,6 @@ def process_stateful_pipeline():
                 for t in str(terms_val).split(";"):
                     if t.strip(): all_terms.add(t.strip())
 
-            # 🌟 ARRAY-SAFE LOGIC CONVERSION FOR FAR CLAUSES
             far_val = doc.get("far_clauses", "")
             if isinstance(far_val, list):
                 for f in far_val:
@@ -409,18 +424,19 @@ def process_stateful_pipeline():
                 "funding_delta_obligated": delta_tot,
                 "cumulative_obligated_total": cum_obligated_total,
                 "funding_delta_anticipated": delta_tot,
-                "cumulative_anticipated_total": max(cum_obligated_total, latest_stated_ceiling),
+                "cumulative_anticipated_total": max(cum_obligated_total, active_ceiling_envelope),
                 "scope_or_terms_summary": f"Sequence ledger entry #{doc['_db_sequence']} compiled via file: {fname}"
             })
 
+            # Format the running state horizontally so it automatically surfaces on your active spreadsheet rows
             chronological_document_ledger.append({
                 "document_name": fname,
                 "execution_date": exec_date,
                 "dollar_delta": delta_tot,
-                "adjusted_performance_end_date": final_end_date
+                "adjusted_performance_end_date": f"{display_end_date} (Cum Oblig: ${cum_obligated_total:,.2f} | Envelope: {display_ceiling})"
             })
 
-        final_total_awarded = max(cum_obligated_total, latest_stated_ceiling)
+        final_total_awarded = active_ceiling_envelope if active_ceiling_envelope > 0 else cum_obligated_total
 
         synthesized_json["start_date"] = final_start_date
         synthesized_json["end_date"] = final_end_date
@@ -445,7 +461,9 @@ def process_stateful_pipeline():
         synthesized_json["validation_flags"] = "CLEAN"
         synthesized_json["discrepancy_summary"] = "No structural failures found inside event stream loop tracker."
 
-        registry_row = master_registry_cache.get(str(proposal_id), {})
+        # 🌟 PRESERVED LOOKUP: Strips outer spacing but retains canonical dash to ensure a 100% cache index hit
+        clean_proposal_key = str(proposal_id).strip()
+        registry_row = master_registry_cache.get(clean_proposal_key, {})
         
         synthesized_json["_oracle_end_date"] = parse_mixed_date(registry_row.get("ORACLE_END_DATE", "N/A"))
         synthesized_json["_cayuse_end_date"] = parse_mixed_date(registry_row.get("CAYUSE_END_DATE", "N/A"))

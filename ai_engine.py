@@ -90,13 +90,25 @@ DATA_SCHEMA = genai_types.Schema(
         "special_interest_thecb": genai_types.Schema(type=genai_types.Type.STRING),
         "subject_to_single_audit": genai_types.Schema(type=genai_types.Type.STRING),
         
-        # Standalone Financial Balances
-        "direct_funding_delta": genai_types.Schema(type=genai_types.Type.STRING),
-        "indirect_funding_delta": genai_types.Schema(type=genai_types.Type.STRING),
-        "total_funding_delta": genai_types.Schema(type=genai_types.Type.STRING),
-        
-        # Overall Maximum Awarded Cumulative Ceiling Stated on Notice Page face
-        "total_awarded_ceiling": genai_types.Schema(type=genai_types.Type.STRING),
+        # ──────────────────────────────────────────────────────────────────
+        # FINANCIAL REALIGNMENT PASS: CONTEXTUAL RESEARCH SETUP GUIDES
+        # ──────────────────────────────────────────────────────────────────
+        "direct_funding_delta": genai_types.Schema(
+            type=genai_types.Type.STRING, 
+            description="The incremental change (+/-) in direct costs introduced solely by this individual file action. Look for labels like 'Direct Costs' or 'Current Action Direct'."
+        ),
+        "indirect_funding_delta": genai_types.Schema(
+            type=genai_types.Type.STRING, 
+            description="The incremental change (+/-) in indirect/F&A costs introduced solely by this individual file action. Look for labels like 'Indirect Costs' or 'Current Action F&A'."
+        ),
+        "total_funding_delta": genai_types.Schema(
+            type=genai_types.Type.STRING, 
+            description="The explicit incremental total funding amount obligated or authorized by THIS individual notice action. Look for labels like 'Amount of This Action', 'Total Federal Share Obligated', 'Obligated Amount', 'This Action Total', or 'Funding Delta'. For No-Cost Extensions (NCE), always return '0.0'."
+        ),
+        "total_awarded_ceiling": genai_types.Schema(
+            type=genai_types.Type.STRING, 
+            description="The overall maximum cumulative anticipated or approved project ceiling value stated on the face of THIS specific notice page. Look for labels like 'Total Project Period Approved Amount', 'Cumulative Estimated Total Cost', 'Anticipated Project Total', or 'Ceiling Envelope'. If unstated, return 'N/A'."
+        ),
         
         # Multi-Dimensional Arrays
         "deliverables": genai_types.Schema(
@@ -126,7 +138,8 @@ DATA_SCHEMA = genai_types.Schema(
             )
         )
     },
-    required=["parent_proposal_number", "sponsor_award_number", "modification_number", "document_execution_date", "total_funding_delta"]
+    # 🌟 LOOSENED VALIDATION GATE: Reduced to bare minimum fields to allow polymorphic parameter extraction
+    required=["parent_proposal_number", "total_funding_delta"]
 )
 
 

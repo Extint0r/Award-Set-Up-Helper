@@ -1,0 +1,84 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:icalendar-ruby
+CALSCALE:GREGORIAN
+X-PRIMARY-CALENDAR:TRUE
+BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:DAYLIGHT
+DTSTART:20260308T030000
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+RRULE:FREQ=YEARLY;BYDAY=2SU;BYMONTH=3
+TZNAME:EDT
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20261101T010000
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+RRULE:FREQ=YEARLY;BYDAY=1SU;BYMONTH=11
+TZNAME:EST
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:DAYLIGHT
+DTSTART:20260308T030000
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+RRULE:FREQ=YEARLY;BYDAY=2SU;BYMONTH=3
+TZNAME:EDT
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20261101T010000
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+RRULE:FREQ=YEARLY;BYDAY=1SU;BYMONTH=11
+TZNAME:EST
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+DTSTAMP:20260713T180103Z
+UID:126922520_241348881
+DTSTART;TZID=America/New_York:20260801T103000
+DTEND;TZID=America/New_York:20260801T120000
+CREATED:20260713T175959Z
+DESCRIPTION:Organizer Name: NCURA Region V Administrator\nOrganizer Email: 
+ ncuraregionv@gmail.com\n\nDescription: Regional Connection TableWe are loo
+ king for individuals to welcome our members at the national meeting from F
+ riday \, July 31\, to Sunday\, August 2. Volunteers will work the Regional
+  Connection Table\, located across from the meeting registration desk. Vol
+ unteers will greet members\, hand out lanyards & drink tickets\, ensure me
+ mbers are aware of regional activities (Netzone and regional business meet
+ ing)\, answer general meeting questions\, and help guide new attendees thr
+ ough the schedule. Don't forget to stop by for some amazing Region swag an
+ d conversation!\n\n
+LOCATION:1335 Avenue of the Americas New York\, NY 10019- New York Hilton M
+ idtown
+SEQUENCE:3696263
+SUMMARY:Region V Volunteers for NCURA AM 68: Regional Connection Table Volu
+ nteer
+END:VEVENT
+BEGIN:VEVENT
+DTSTAMP:20260713T180103Z
+UID:126922520_241348884
+DTSTART;TZID=America/New_York:20260801T150000
+DTEND;TZID=America/New_York:20260801T160000
+CREATED:20260713T180049Z
+DESCRIPTION:Organizer Name: NCURA Region V Administrator\nOrganizer Email: 
+ ncuraregionv@gmail.com\n\nDescription: Regional Connection TableWe are loo
+ king for individuals to welcome our members at the national meeting from F
+ riday \, July 31\, to Sunday\, August 2. Volunteers will work the Regional
+  Connection Table\, located across from the meeting registration desk. Vol
+ unteers will greet members\, hand out lanyards & drink tickets\, ensure me
+ mbers are aware of regional activities (Netzone and regional business meet
+ ing)\, answer general meeting questions\, and help guide new attendees thr
+ ough the schedule. Don't forget to stop by for some amazing Region swag an
+ d conversation!\n\n
+LOCATION:1335 Avenue of the Americas New York\, NY 10019- New York Hilton M
+ idtown
+SEQUENCE:3696301
+SUMMARY:Region V Volunteers for NCURA AM 68: Regional Connection Table Volu
+ nteer
+END:VEVENT
+END:VCALENDAR
