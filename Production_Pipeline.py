@@ -13,14 +13,23 @@ from datetime import datetime
 # Suppress non-fatal MuPDF C-library rendering syntax noise
 fitz.TOOLS.mupdf_display_errors(False)
 
-# Directory Paths (Adjust as needed)
-PDF_INPUT_DIR = Path(r"D:\0-Batch-AWARDS\source_pdfs")
-MD_OUTPUT_DIR = Path(r"D:\0-Batch-AWARDS\processed_files\Markdown")
-MASTER_EXCEL_PATH = Path("TRIAGE_EXCEL_PATH.xlsx")
-OUTPUT_EXCEL_PATH = Path("AUDIT_INDEX_TABLE.xlsx")
-OUTPUT_SQLITE_PATH = Path("AUDIT_INDEX_TABLE.db")
+# ==============================================================================
+# PATH & ENVIRONMENT CONFIGURATION
+# ==============================================================================
+TRIAGE_EXCEL_PATH = r"2026_7_20_CAYUSE_ORACLE_TRIAGE.xlsx"
+ALN_CSV_PATH = r"ALN.csv"
 
+PDF_SOURCE_DIR = Path(r"D:\0-Batch-AWARDS\processed_files")
+MD_OUTPUT_DIR = Path(r"D:\0-Batch-AWARDS\processed_files\Markdown")
+REVIEW_DIR = Path(r"D:\0-Batch-AWARDS\processed_files\Review")
+
+# Output Artifacts
+REVIEW_TABLE_PATH = REVIEW_DIR / "AUDIT_INDEX_TABLE.xlsx"
+OUTPUT_SQLITE_PATH = REVIEW_DIR / "AUDIT_INDEX_TABLE.db"
+
+# Ensure directories exist
 MD_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+REVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==============================================================================
 # 1. REGEX PATTERNS & REGEX MATCHING ENGINES
@@ -217,7 +226,8 @@ def process_pdf_pass_1(pdf_path: Path) -> dict:
 def run_pipeline():
     print("🚀 Starting v6 Processing Pipeline (Strategy 2 Ready)...")
     
-    pdf_files = list(PDF_INPUT_DIR.glob("*.pdf"))
+    # FIX 1: Use PDF_SOURCE_DIR defined in config block
+    pdf_files = list(PDF_SOURCE_DIR.glob("*.pdf"))
     print(f"📁 Found {len(pdf_files)} PDF documents to process.")
 
     records = []
@@ -280,7 +290,8 @@ def run_pipeline():
     df = df[canonical_columns]
 
     # Save to Excel & SQLite Database
-    df.to_excel(OUTPUT_EXCEL_PATH, index=False)
+    # FIX 2: Use REVIEW_TABLE_PATH defined in config block
+    df.to_excel(REVIEW_TABLE_PATH, index=False)
     
     import sqlite3
     conn = sqlite3.connect(OUTPUT_SQLITE_PATH)
@@ -294,7 +305,8 @@ def run_pipeline():
     print(df['Match_Confidence'].value_counts().to_string())
     print("------------------------------------------------------------------")
     print(f"Budget Tables Tagged    : {df['HAS_BUDGET_TABLE'].sum()} documents")
-    print(f"Output Audit Excel      : {OUTPUT_EXCEL_PATH}")
+    # FIX 3: Use REVIEW_TABLE_PATH defined in config block
+    print(f"Output Audit Excel      : {REVIEW_TABLE_PATH}")
     print(f"Output Portfolio SQLite : {OUTPUT_SQLITE_PATH}")
     print("==================================================================")
 
