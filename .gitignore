@@ -19,3 +19,4 @@ legacy_pdf_vault/
 *.db
 *.csv
 *.txt
+*.xlsx
