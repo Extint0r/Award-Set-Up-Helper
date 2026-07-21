@@ -1,408 +1,302 @@
 import os
 import re
-import yaml
+import glob
 import fitz  # PyMuPDF
-import difflib
 import pandas as pd
+import yaml
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# PATH CONFIGURATION
-# ---------------------------------------------------------------------------
-TRIAGE_EXCEL_PATH = r"2026_7_20_CAYUSE_ORACLE_TRIAGE.xlsx"
-ALN_CSV_PATH = r"ALN.csv"
+# ==============================================================================
+# 0. TERMINAL WARNING SUPPRESSION & PATH CONFIGURATION
+# ==============================================================================
+# Suppress non-fatal MuPDF C-library rendering syntax noise
+fitz.TOOLS.mupdf_display_errors(False)
 
-PDF_SOURCE_DIR = Path(r"D:\0-Batch-AWARDS\processed_files")
+# Directory Paths (Adjust as needed)
+PDF_INPUT_DIR = Path(r"D:\0-Batch-AWARDS\source_pdfs")
 MD_OUTPUT_DIR = Path(r"D:\0-Batch-AWARDS\processed_files\Markdown")
-REVIEW_DIR = Path(r"D:\0-Batch-AWARDS\processed_files\Review")
-REVIEW_TABLE_PATH = REVIEW_DIR / "AUDIT_INDEX_TABLE.xlsx"
+MASTER_EXCEL_PATH = Path("TRIAGE_EXCEL_PATH.xlsx")
+OUTPUT_EXCEL_PATH = Path("AUDIT_INDEX_TABLE.xlsx")
+OUTPUT_SQLITE_PATH = Path("AUDIT_INDEX_TABLE.db")
 
 MD_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-REVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# 1. LOAD & SANITIZE REFERENCE DATA (MASTER, ALN & PIs)
-# ---------------------------------------------------------------------------
-def clean_str_id(val):
-    """Sanitizes floating point artifacts (.0) and converts inputs to clean strings."""
-    if pd.isna(val) or val is None:
-        return ''
-    s = str(val).strip()
-    if s.endswith('.0'):
-        s = s[:-2]
-    return '' if s.lower() in ['nan', 'none', '0', ''] else s
+# ==============================================================================
+# 1. REGEX PATTERNS & REGEX MATCHING ENGINES
+# ==============================================================================
+# Standard Identifiers
+RE_CAYUSE_PROJ = re.compile(r'\b(\d{2}-\d{4})\b')
+RE_CAYUSE_PROP = re.compile(r'\b(A\d{2}-\d{4})\b')
+RE_ORACLE_NUM  = re.compile(r'\b(\d{6})\b')
+RE_BANNER_UID  = re.compile(r'\b(R[0-9A-Z]{5})\b', re.IGNORECASE)
 
-def normalize_aln_key(val):
-    """Standardizes ALN formatting (e.g. 81.87 -> 81.087)."""
-    val = clean_str_id(val)
-    if '.' in val:
-        parts = val.split('.')
-        agency = parts[0].zfill(2)
-        prog = parts[1].ljust(3, '0')[:3]
-        return f"{agency}.{prog}"
-    return val
+# Document Action Tags
+RE_ACTION_TAGS = re.compile(
+    r'\b(SubA(?:ward)?|SubB|Subgrant|Amd\s*\d*|Amendment\s*\d*|NCE|No-Cost\s*Ext\w*|'
+    r'inv(?:ention)?\s*rpt|progress\s*rpt|PR|Y\d+-\d+\s*PRs?|MOU|A-133|Supplement)\b', 
+    re.IGNORECASE
+)
 
-def load_reference_data(excel_path, aln_path):
-    df_master = pd.read_excel(excel_path, sheet_name='MASTER').fillna('')
-    
-    proj_map, prop_map, oracle_map, fed_map = {}, {}, {}, {}
-    master_pi_list = [p for p in df_master['LEAD_PI'].dropna().astype(str).str.strip().unique().tolist() if p]
-    
-    for idx, row in df_master.iterrows():
-        proj = clean_str_id(row.get('CAYUSE_PROJECT_NUMBER', ''))
-        prop = clean_str_id(row.get('CAYUSE_PROPOSAL_NUMBER', ''))
-        orc = clean_str_id(row.get('ORACLE_AWARD_NUMBER', ''))
-        fed = clean_str_id(row.get('FEDERAL_AWARD_IDENTIFIER', ''))
-        
-        row_dict = row.to_dict()
-        for k, v in row_dict.items():
-            if isinstance(v, float) and v.is_integer():
-                row_dict[k] = str(int(v))
-            elif isinstance(v, float) and pd.isna(v):
-                row_dict[k] = ''
+# Date Search Patterns
+RE_DATE_GENERIC = re.compile(
+    r'\b(\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}|'
+    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4})\b', 
+    re.IGNORECASE
+)
 
-        if proj: proj_map[proj.upper()] = row_dict
-        if prop: prop_map[prop] = row_dict
-        if orc: oracle_map[orc.upper()] = row_dict
-        if fed and len(fed) >= 4: fed_map[fed.upper()] = row_dict
+# Budget Keyword Signals (Strategy 2 Manifest Tagging)
+BUDGET_PAGE_KEYWORDS = [
+    'budget summary', 'direct cost', 'indirect cost', 'f&a rate',
+    'fringe benefit', 'personnel justification', 'total requested',
+    'modified total direct', 'equipment', 'travel', 'contractual',
+    'subaward budget', 'budget justification'
+]
 
-    aln_lookup = {}
-    if Path(aln_path).exists():
-        aln_df = pd.read_csv(aln_path, dtype=str).fillna('')
-        for idx, row in aln_df.iterrows():
-            raw_aln = str(row.get('ALN', '')).strip()
-            title = str(row.get('ALN_PROGRAM_TITLE', '')).strip()
-            if raw_aln and raw_aln.lower() != 'nan':
-                norm_aln = normalize_aln_key(raw_aln)
-                aln_lookup[norm_aln] = title
-                aln_lookup[raw_aln] = title
-
-    return proj_map, prop_map, oracle_map, fed_map, aln_lookup, master_pi_list
-
-# ---------------------------------------------------------------------------
-# 2. HELPER ENGINES (ALN, STICKY PI RECONCILIATION & LEGACY RESOLUTION)
-# ---------------------------------------------------------------------------
-def extract_aln_details(filename, page_texts, aln_lookup):
-    aln_pattern = r'(?<!\d)(\d{2}\.\d{3})(?!\d)'
-    fn_matches = re.findall(aln_pattern, filename)
-    if fn_matches:
-        aln_num = fn_matches[0]
-        title = aln_lookup.get(aln_num, aln_lookup.get(normalize_aln_key(aln_num), 'Title Not in ALN.csv'))
-        return aln_num, title, 'Filename'
-
-    for page_idx, page_text in enumerate(page_texts):
-        page_matches = re.findall(aln_pattern, page_text)
-        if page_matches:
-            aln_num = page_matches[0]
-            title = aln_lookup.get(aln_num, aln_lookup.get(normalize_aln_key(aln_num), 'Title Not in ALN.csv'))
-            return aln_num, title, f'Page {page_idx + 1}'
-
-    return 'N/A', 'N/A', 'Not Found'
-
-def classify_document(text):
-    text_upper = text.upper()
-    amendment_keywords = ['AMENDMENT', 'MODIFICATION', 'REVISION', 'NOGA AMENDMENT', 'EXTENSION', 'AMD']
-    if any(kw in text_upper for kw in amendment_keywords):
-        return "Amendment/Modification"
-    return "Award/Notice of Award"
-
-def extract_and_reconcile_pi(filename, page_1_text, master_pi_list):
-    """
-    Extracts PI from Page 1 or filename and fuzzy-matches against MASTER PIs 
-    enforcing a strict >= 90% match threshold.
-    """
-    raw_pi_candidate = None
-
-    # 1. Check Page 1 text for PI header block (e.g. PI: Aazhang, Behnaam)
-    pi_text_match = re.search(r'\bPI\b.*?\n(?:[^\n]+\n){0,3}?([A-Za-z\-]+,\s*[A-Za-z\-]+)', page_1_text, re.IGNORECASE)
-    if pi_text_match:
-        parts = pi_text_match.group(1).split(',')
-        raw_pi_candidate = f"{parts[1].strip()} {parts[0].strip()}"
-
-    # 2. Check Filename fallback (e.g. Aazhang_Behnaam_...)
-    if not raw_pi_candidate:
-        fn_parts = filename.split('_')
-        if len(fn_parts) >= 2 and not fn_parts[0].isdigit() and not re.match(r'^\d{2}-\d{4}', fn_parts[0]):
-            raw_pi_candidate = f"{fn_parts[1].strip()} {fn_parts[0].strip()}"
-
-    if not raw_pi_candidate:
-        return "UNKNOWN"
-
-    # 3. Fuzzy match against canonical MASTER PIs (Strict Threshold >= 0.90)
-    best_match = None
-    best_score = 0.0
-
-    for master_pi in master_pi_list:
-        ratio = difflib.SequenceMatcher(None, raw_pi_candidate.lower(), master_pi.lower()).ratio()
-        parts = raw_pi_candidate.split()
-        if len(parts) >= 2:
-            swapped = f"{parts[1]} {parts[0]}".lower()
-            ratio_swapped = difflib.SequenceMatcher(None, swapped, master_pi.lower()).ratio()
-            ratio = max(ratio, ratio_swapped)
-
-        if ratio > best_score:
-            best_score = ratio
-            best_match = master_pi
-
-    # Require >= 90% similarity score
-    if best_score >= 0.90:
-        return best_match
-    else:
-        return raw_pi_candidate
-
-def resolve_legacy_identifiers(filename, full_text):
-    """
-    Chronological multi-tier evaluator for legacy/unindexed identifiers.
-    """
-    # 1. Search for explicit 'A'-prefixed Project Codes (AYY-XXXX)
-    proj_code_matches = re.findall(
-        r'(?<![A-Za-z0-9])(A\d{2}-\d{3,4}(?:-\d{2,4})?)(?![A-Za-z0-9])', 
-        f"{filename} {full_text}", re.I
-    )
-    
-    # 2. Search for all bare YY-XXXX identifiers (excluding those inside AYY-XXXX)
-    bare_matches = re.findall(r'(?<![A-Za-z0-9])(\d{2}-\d{4})(?![A-Za-z0-9])', f"{filename} {full_text}")
-    unique_bare = list(dict.fromkeys(bare_matches))
-
-    # --- TIER 1: Explicit 'A' Prefix Present ---
-    if proj_code_matches:
-        found_proj = proj_code_matches[0].upper()
-        found_prop = unique_bare[0] if unique_bare else "N/A"
-        return found_proj, found_prop, "Legacy/Historical Project", f"Extracted Project Code ({found_proj}) and Proposal ID ({found_prop})"
-
-    # --- TIER 2: Multiple Bare YY-XXXX Codes Found (Chronological Sequence Split) ---
-    if len(unique_bare) >= 2:
-        parsed = []
-        for code in unique_bare:
-            yy, xxxx = code.split('-')
-            parsed.append((int(yy), int(xxxx), code))
-        
-        # Sort ascending: lower (Year, Sequence) comes first
-        parsed_sorted = sorted(parsed, key=lambda x: (x[0], x[1]))
-        
-        lower_prop = parsed_sorted[0][2]   # Proposal ID (submitted earlier)
-        higher_proj = parsed_sorted[-1][2]  # Legacy Project ID (awarded later)
-        
-        return higher_proj, lower_prop, "Legacy/Historical Split", f"Chronological Sequence Split: Proposal ({lower_prop}) < Project ({higher_proj})"
-
-    # --- TIER 3: Single Bare Identifier Found ---
-    if len(unique_bare) == 1:
-        cand_prop = unique_bare[0]
-        return "NOT_IN_MASTER", cand_prop, "Legacy/Historical Proposal", f"Extracted Single Proposal Identifier ({cand_prop})"
-
-    return "NOT_IN_MASTER", "N/A", "Unmatched", "No Cayuse identifiers found"
-
-def precision_progressive_match(filename, page_texts, proj_map, prop_map, oracle_map, fed_map):
-    """
-    Accuracy-First Progressive Matching Engine with Alphanumeric Oracle Support.
-    """
-    full_text = " ".join(page_texts)
-    pass1_target = f"{filename} " + " ".join(page_texts[:5])
-
-    # --- PASS 1: Active MASTER Match (Front Pages + Filename) ---
-    # 1. Project ID candidate (AYY-XXXX)
-    proj_cands = re.findall(r'(?<![A-Za-z0-9])(A\d{2}-\d{3,4}(?:-\d{2,4})?)(?![A-Za-z0-9])', pass1_target, re.I)
-    for pc in proj_cands:
-        clean_pc = pc.upper()
-        if clean_pc in proj_map:
-            return proj_map[clean_pc], "High", f"Matched Active CAYUSE_PROJECT_NUMBER ({clean_pc}) [Pass 1]", None, None, None
-        base_pc = clean_pc.rsplit('-', 1)[0] if clean_pc.count('-') > 1 else clean_pc
-        if base_pc in proj_map:
-            return proj_map[base_pc], "High", f"Matched Active CAYUSE_PROJECT_NUMBER ({base_pc}) [Pass 1]", None, None, None
-
-    # 2. Proposal ID candidate (YY-XXXX)
-    prop_cands = re.findall(r'(?<![A-Za-z0-9])(\d{2}-\d{4})(?![A-Za-z0-9])', pass1_target)
-    for prc in prop_cands:
-        if prc in prop_map:
-            return prop_map[prc], "High", f"Matched Active CAYUSE_PROPOSAL_NUMBER ({prc}) [Pass 1]", None, None, None
-
-    # 3. Oracle Award ID candidate (6-digit numeric OR R-prefixed e.g. R66720, 137033)
-    orc_cands = re.findall(r'(?<![A-Za-z0-9])(1\d{5}|R\d[A-Za-z0-9]{4,6}(?:-[A-Za-z0-9]+)?)(?![A-Za-z0-9])', pass1_target, re.I)
-    for oc in orc_cands:
-        clean_oc = oc.upper()
-        if clean_oc in oracle_map:
-            return oracle_map[clean_oc], "Medium-High", f"Matched Active ORACLE_AWARD_NUMBER ({clean_oc}) [Pass 1]", None, None, None
-
-    # 4. Federal Award ID
-    for fed_key, row in fed_map.items():
-        if fed_key in pass1_target.upper():
-            return row, "Medium", f"Matched Active FEDERAL_AWARD_IDENTIFIER ({fed_key}) [Pass 1]", None, None, None
-
-    # --- PASS 2: Active MASTER Deep Scan (Pages 6+) ---
-    if len(page_texts) > 5:
-        deep_target = " ".join(page_texts[5:])
-        deep_proj = re.findall(r'(?<![A-Za-z0-9])(A\d{2}-\d{3,4}(?:-\d{2,4})?)(?![A-Za-z0-9])', deep_target, re.I)
-        for pc in deep_proj:
-            clean_pc = pc.upper()
-            if clean_pc in proj_map:
-                return proj_map[clean_pc], "Low-Medium", f"Matched Active CAYUSE_PROJECT_NUMBER ({clean_pc}) [Pass 2]", None, None, None
-
-        deep_prop = re.findall(r'(?<![A-Za-z0-9])(\d{2}-\d{4})(?![A-Za-z0-9])', deep_target)
-        for prc in deep_prop:
-            if prc in prop_map:
-                return prop_map[prc], "Low-Medium", f"Matched Active CAYUSE_PROPOSAL_NUMBER ({prc}) [Pass 2]", None, None, None
-
-    # --- PASS 3: LEGACY / HISTORICAL EXTRACTION ENGINE ---
-    leg_oracle = orc_cands[0].upper() if orc_cands else "NOT_IN_MASTER"
-    leg_proj, leg_prop, leg_conf, leg_reason = resolve_legacy_identifiers(filename, full_text)
-
-    return None, leg_conf, leg_reason, leg_proj, leg_prop, leg_oracle
-
-# ---------------------------------------------------------------------------
-# 3. WORKER FUNCTION FOR SINGLE PDF
-# ---------------------------------------------------------------------------
-def process_single_pdf(pdf_path, proj_map, prop_map, oracle_map, fed_map, aln_lookup, master_pi_list):
+# ==============================================================================
+# 2. HELPER FUNCTIONS
+# ==============================================================================
+def normalize_date(date_str: str) -> str:
+    """Parses various raw date strings into standard YYYY-MM-DD format."""
+    if not date_str:
+        return ""
     try:
-        doc = fitz.open(pdf_path)
-        page_texts = [page.get_text() for page in doc]
-        doc.close()
+        dt = pd.to_datetime(date_str, errors='coerce')
+        if pd.notnull(dt):
+            return dt.strftime('%Y-%m-%d')
+    except Exception:
+        pass
+    return ""
 
-        # Build Markdown Body
-        full_text_pages = [f"## Page {i+1}\n\n" + text for i, text in enumerate(page_texts)]
-        full_markdown_body = "\n\n".join(full_text_pages)
+def extract_action_tags(filename: str, text_head: str) -> str:
+    """Extracts administrative action tags (SubA, Amd01, NCE, etc.) from filename and text."""
+    matches = set()
+    for m in RE_ACTION_TAGS.findall(filename):
+        matches.add(m.strip().replace(" ", ""))
+    for m in RE_ACTION_TAGS.findall(text_head[:1000]):
+        matches.add(m.strip().replace(" ", ""))
+    return "; ".join(sorted(matches)) if matches else "Standard Award"
 
-        # Document Classification
-        combined_head = f"{pdf_path.name} " + " ".join(page_texts[:3])
-        doc_type = classify_document(combined_head)
-
-        # High-Accuracy Matching Engine
-        match_data, confidence, reason, leg_proj, leg_prop, leg_oracle = precision_progressive_match(
-            pdf_path.name, page_texts, proj_map, prop_map, oracle_map, fed_map
-        )
-
-        aln_num, aln_title, aln_source = extract_aln_details(pdf_path.name, page_texts, aln_lookup)
-
-        # Assign Key Identifiers
-        if match_data:
-            cayuse_proj_no = clean_str_id(match_data.get('CAYUSE_PROJECT_NUMBER', 'UNMATCHED'))
-            cayuse_prop_no = clean_str_id(match_data.get('CAYUSE_PROPOSAL_NUMBER', 'N/A'))
-            oracle_award_no = clean_str_id(match_data.get('ORACLE_AWARD_NUMBER', 'N/A'))
-            lead_pi = clean_str_id(match_data.get('LEAD_PI', 'UNKNOWN'))
-            fed_id = clean_str_id(match_data.get('FEDERAL_AWARD_IDENTIFIER', 'N/A'))
-            sponsor = clean_str_id(match_data.get('CAYUSE_SPONSOR_NAME', 'N/A'))
-            prefix_id = cayuse_proj_no if cayuse_proj_no != 'UNMATCHED' else f"PROP_{cayuse_prop_no}"
-        else:
-            cayuse_proj_no = leg_proj if leg_proj else "NOT_IN_MASTER"
-            cayuse_prop_no = leg_prop if leg_prop else "N/A"
-            oracle_award_no = leg_oracle if leg_oracle else "NOT_IN_MASTER"
-            
-            # Reconcile PI via Fuzzy Matching (Strict >= 90%)
-            p1_text = page_texts[0] if page_texts else ""
-            lead_pi = extract_and_reconcile_pi(pdf_path.name, p1_text, master_pi_list)
-            
-            fed_id = "N/A"
-            sponsor = "N/A"
-            
-            if cayuse_proj_no != "NOT_IN_MASTER":
-                prefix_id = f"HISTORICAL_PROJ_{cayuse_proj_no}"
-            elif cayuse_prop_no != "N/A":
-                prefix_id = f"HISTORICAL_PROP_{cayuse_prop_no}"
-            else:
-                prefix_id = "UNMATCHED"
-
-        # YAML Frontmatter Header
-        yaml_header = {
-            'document_type': doc_type,
-            'cayuse_project_number': cayuse_proj_no,
-            'cayuse_proposal_number': cayuse_prop_no,
-            'oracle_award_number': oracle_award_no,
-            'lead_pi': lead_pi,
-            'federal_award_identifier': fed_id,
-            'sponsor_name': sponsor,
-            'aln_number': aln_num,
-            'aln_program_title': aln_title,
-            'aln_source': aln_source,
-            'match_confidence': confidence,
-            'match_reason': reason,
-            'original_pdf_name': pdf_path.name
-        }
-
-        yaml_str = "---\n" + yaml.dump(yaml_header, sort_keys=False) + "---\n\n"
-        final_md_content = yaml_str + full_markdown_body
-
-        # Save Markdown File
-        new_md_filename = f"{prefix_id}_{pdf_path.stem}.md"
-        new_md_filename = re.sub(r'[\\/*?:"<>|]', '_', new_md_filename)
-        output_md_path = MD_OUTPUT_DIR / new_md_filename
-        
-        with open(output_md_path, 'w', encoding='utf-8') as f:
-            f.write(final_md_content)
-
-        return {
-            'PDF_Path': str(pdf_path.resolve()),
-            'Markdown_Path': str(output_md_path.resolve()),
-            'Original_Filename': pdf_path.name,
-            'Markdown_Filename': new_md_filename,
-            'CAYUSE_PROJECT_NUMBER': cayuse_proj_no,
-            'CAYUSE_PROPOSAL_NUMBER': cayuse_prop_no,
-            'ORACLE_AWARD_NUMBER': oracle_award_no,
-            'LEAD_PI': lead_pi,
-            'ALN_NUMBER': aln_num,
-            'ALN_PROGRAM_TITLE': aln_title,
-            'ALN_SOURCE': aln_source,
-            'Document_Type': doc_type,
-            'Match_Confidence': confidence,
-            'Match_Reason': reason
-        }
-
-    except Exception as e:
-        return {
-            'PDF_Path': str(pdf_path.resolve()),
-            'Markdown_Path': 'ERROR',
-            'Original_Filename': pdf_path.name,
-            'Markdown_Filename': 'ERROR',
-            'CAYUSE_PROJECT_NUMBER': 'ERROR',
-            'CAYUSE_PROPOSAL_NUMBER': 'ERROR',
-            'ORACLE_AWARD_NUMBER': 'ERROR',
-            'LEAD_PI': 'ERROR',
-            'ALN_NUMBER': 'ERROR',
-            'ALN_PROGRAM_TITLE': 'ERROR',
-            'ALN_SOURCE': 'ERROR',
-            'Document_Type': 'ERROR',
-            'Match_Confidence': 'Failed',
-            'Match_Reason': f"Processing Error: {str(e)}"
-        }
-
-# ---------------------------------------------------------------------------
-# 4. MAIN BATCH RUNNER
-# ---------------------------------------------------------------------------
-def run_pipeline():
-    print("Loading Master Triage Index, ALN Lookup & Canonical PIs...")
-    proj_map, prop_map, oracle_map, fed_map, aln_lookup, master_pi_list = load_reference_data(
-        TRIAGE_EXCEL_PATH, ALN_CSV_PATH
-    )
-    print(f"Loaded {len(master_pi_list)} Canonical PIs and {len(aln_lookup)} ALN titles.")
-
-    pdf_files = [f for f in PDF_SOURCE_DIR.glob("*.pdf") if f.is_file()]
-    print(f"Found {len(pdf_files)} top-level PDF files in {PDF_SOURCE_DIR}.")
-
-    audit_records = []
-    with ProcessPoolExecutor() as executor:
-        futures = [
-            executor.submit(process_single_pdf, pdf, proj_map, prop_map, oracle_map, fed_map, aln_lookup, master_pi_list) 
-            for pdf in pdf_files
-        ]
-        for idx, future in enumerate(as_completed(futures)):
-            result = future.result()
-            audit_records.append(result)
-            if (idx + 1) % 2500 == 0 or (idx + 1) == len(pdf_files):
-                print(f"Processed [{idx + 1}/{len(pdf_files)}] files...")
-
-    # Output Audit Index Table
-    df_audit = pd.DataFrame(audit_records)
-    df_audit.to_excel(REVIEW_TABLE_PATH, index=False)
+def scan_dates_from_text(text: str):
+    """Scans header text for performance start and end dates."""
+    start_date, end_date = "", ""
+    lines = text.split('\n')
     
-    print("\n" + "="*60)
-    print("PIPELINE EXECUTION COMPLETE")
-    print("="*60)
-    print(f"Total Files Processed: {len(df_audit)}")
-    print("\nMatch Confidence Breakdown:")
-    print(df_audit['Match_Confidence'].value_counts())
-    print("\nALN Extraction Summary:")
-    print(df_audit['ALN_SOURCE'].value_counts())
-    print(f"\n -> Markdown directory: {MD_OUTPUT_DIR}")
-    print(f" -> Master review index: {REVIEW_TABLE_PATH}")
+    for line in lines[:100]:  # Limit scan to top administrative portion
+        line_lower = line.lower()
+        if any(kw in line_lower for kw in ['start date', 'effective date', 'period of performance start', 'from']):
+            m = RE_DATE_GENERIC.search(line)
+            if m and not start_date:
+                start_date = normalize_date(m.group(1))
+        if any(kw in line_lower for kw in ['end date', 'expiration date', 'period of performance end', 'through', 'valid to']):
+            m = RE_DATE_GENERIC.search(line)
+            if m and not end_date:
+                end_date = normalize_date(m.group(1))
+                
+    return start_date, end_date
+
+def detect_budget_pages(doc: fitz.Document):
+    """Identifies candidate pages containing budget tables or justifications (Strategy 2)."""
+    budget_pages = []
+    for idx, page in enumerate(doc):
+        p_text = page.get_text().lower()
+        matches = sum(1 for kw in BUDGET_PAGE_KEYWORDS if kw in p_text)
+        # Higher keyword density indicates explicit budget table/justification page
+        if matches >= 2:
+            budget_pages.append(idx + 1)  # 1-indexed page numbering
+    return len(budget_pages) > 0, budget_pages
+
+# ==============================================================================
+# 3. PASS 1: PER-FILE PROCESSING ENGINE
+# ==============================================================================
+def process_pdf_pass_1(pdf_path: Path) -> dict:
+    filename = pdf_path.name
+    doc = fitz.open(pdf_path)
+    
+    # Extract raw text (First 3 pages for administrative headers)
+    header_text = ""
+    for i in range(min(3, len(doc))):
+        header_text += doc[i].get_text() + "\n"
+        
+    full_text = "\n".join([page.get_text() for page in doc])
+
+    # 1. Identifier Extraction
+    cayuse_proj = RE_CAYUSE_PROJ.findall(filename) or RE_CAYUSE_PROJ.findall(header_text)
+    cayuse_prop = RE_CAYUSE_PROP.findall(filename) or RE_CAYUSE_PROP.findall(header_text)
+    oracle_num  = RE_ORACLE_NUM.findall(filename) or RE_ORACLE_NUM.findall(header_text)
+    banner_uid  = RE_BANNER_UID.findall(filename) or RE_BANNER_UID.findall(header_text)
+
+    cay_proj_val = cayuse_proj[0] if cayuse_proj else ""
+    cay_prop_val = cayuse_prop[0] if cayuse_prop else ""
+    oracle_val   = oracle_num[0] if oracle_num else ""
+    banner_val   = banner_uid[0].upper() if banner_uid else ""
+
+    # 2. Action Tag Extraction
+    action_tag = extract_action_tags(filename, header_text)
+
+    # 3. Document Performance Dates (Pass 1)
+    doc_start, doc_end = scan_dates_from_text(header_text)
+
+    # 4. Strategy 2 Budget Table Detection
+    has_budget, budget_pages = detect_budget_pages(doc)
+
+    # 5. Determine Award Match Hierarchy
+    match_conf = "Unmatched"
+    match_reason = "No known master key or legacy UID matched"
+    
+    if oracle_val and oracle_val != "000000":
+        match_conf = "Active Index Match"
+        match_reason = "Matched Oracle Award Number"
+    elif banner_val:
+        match_conf = "Legacy Banner Match"
+        match_reason = f"Matched Legacy Banner Award UID ({banner_val})"
+    elif cay_proj_val:
+        match_conf = "Cayuse Inference"
+        match_reason = "Matched Cayuse Project Number"
+    elif cay_prop_val:
+        match_conf = "Cayuse Proposal Match"
+        match_reason = "Matched Cayuse Proposal Number"
+
+    # Define Unified Cluster Key for Pass 2 Grouping
+    cluster_key = oracle_val or banner_val or cay_proj_val or cay_prop_val or "UNMATCHED"
+
+    # Generate Markdown Output File
+    md_filename = f"{match_conf.replace(' ', '_')}_{pdf_path.stem}.md"
+    md_path = MD_OUTPUT_DIR / md_filename
+
+    frontmatter = {
+        "original_filename": filename,
+        "cayuse_project_number": cay_proj_val,
+        "cayuse_proposal_number": cay_prop_val,
+        "oracle_award_number": oracle_val,
+        "banner_award_uid": banner_val,
+        "action_tag": action_tag,
+        "doc_start_date": doc_start,
+        "doc_end_date": doc_end,
+        "has_budget_table": has_budget,
+        "budget_pages": budget_pages,
+        "match_confidence": match_conf,
+        "match_reason": match_reason
+    }
+
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("---\n")
+        yaml.dump(frontmatter, f, default_flow_style=False)
+        f.write("---\n\n")
+        f.write(f"# Document: {filename}\n\n")
+        f.write(full_text)
+
+    doc.close()
+
+    return {
+        "PDF_Path": str(pdf_path),
+        "Markdown_Path": str(md_path),
+        "Original_Filename": filename,
+        "Markdown_Filename": md_filename,
+        "CAYUSE_PROJECT_NUMBER": cay_proj_val,
+        "CAYUSE_PROPOSAL_NUMBER": cay_prop_val,
+        "ORACLE_AWARD_NUMBER": oracle_val,
+        "BANNER_AWARD_UID": banner_val,
+        "LEAD_PI": "EXTRACTED_PI",  # Reconciled in Master Merge
+        "ALN_NUMBER": "N/A",        # Reconciled in Master Merge
+        "ALN_PROGRAM_TITLE": "N/A",
+        "ALN_SOURCE": "N/A",
+        "DOCUMENT_ACTION_TAG": action_tag,
+        "DOC_START_DATE": doc_start,
+        "DOC_END_DATE": doc_end,
+        "AWARD_CLUSTER_KEY": cluster_key,
+        "HAS_BUDGET_TABLE": has_budget,
+        "BUDGET_PAGES": str(budget_pages),
+        "Match_Confidence": match_conf,
+        "Match_Reason": match_reason
+    }
+
+# ==============================================================================
+# 4. PASS 2: PORTFOLIO-LEVEL DATE AGGREGATION & INDEX BUILD
+# ==============================================================================
+def run_pipeline():
+    print("🚀 Starting v6 Processing Pipeline (Strategy 2 Ready)...")
+    
+    pdf_files = list(PDF_INPUT_DIR.glob("*.pdf"))
+    print(f"📁 Found {len(pdf_files)} PDF documents to process.")
+
+    records = []
+    for idx, pdf in enumerate(pdf_files, 1):
+        try:
+            rec = process_pdf_pass_1(pdf)
+            records.append(rec)
+        except Exception as e:
+            print(f"⚠️ Error processing {pdf.name}: {e}")
+
+        if idx % 1000 == 0 or idx == len(pdf_files):
+            print(f"  -> Processed {idx}/{len(pdf_files)} files...")
+
+    df = pd.DataFrame(records)
+
+    # --------------------------------------------------------------------------
+    # PASS 2: Award Cluster Aggregation Logic
+    # --------------------------------------------------------------------------
+    print("\n🔄 Running Pass 2: Aggregating Award Portfolio Lifecycles...")
+
+    # Calculate min start date and max end date per cluster (excluding unmatched)
+    valid_clusters = df[df['AWARD_CLUSTER_KEY'] != 'UNMATCHED']
+
+    # Groupby aggregations
+    agg_dates = valid_clusters.groupby('AWARD_CLUSTER_KEY').agg(
+        AWARD_CUMULATIVE_START=('DOC_START_DATE', lambda s: min([d for d in s if d] or [''])),
+        AWARD_ULTIMATE_END=('DOC_END_DATE', lambda s: max([d for d in s if d] or ['']))
+    ).reset_index()
+
+    # Merge aggregated dates back into dataframe
+    df = df.merge(agg_dates, on='AWARD_CLUSTER_KEY', how='left')
+    df['AWARD_CUMULATIVE_START'] = df['AWARD_CUMULATIVE_START'].fillna('')
+    df['AWARD_ULTIMATE_END']     = df['AWARD_ULTIMATE_END'].fillna('')
+
+    # Calculate Chronological Sequence Tag (e.g., "Doc 1 of 3")
+    df['DOC_SORT_KEY'] = df['DOC_START_DATE'].replace('', '9999-99-99')
+    df = df.sort_values(by=['AWARD_CLUSTER_KEY', 'DOC_SORT_KEY', 'Original_Filename'])
+    
+    df['CLUSTER_TOTAL_DOCS'] = df.groupby('AWARD_CLUSTER_KEY')['Original_Filename'].transform('count')
+    df['CLUSTER_DOC_RANK']   = df.groupby('AWARD_CLUSTER_KEY').cumcount() + 1
+    
+    df['CHRONO_SEQUENCE'] = df.apply(
+        lambda r: f"Doc {r['CLUSTER_DOC_RANK']} of {r['CLUSTER_TOTAL_DOCS']}" 
+        if r['AWARD_CLUSTER_KEY'] != 'UNMATCHED' else "N/A", 
+        axis=1
+    )
+
+    # Clean up temporary processing columns
+    df.drop(columns=['AWARD_CLUSTER_KEY', 'DOC_SORT_KEY', 'CLUSTER_TOTAL_DOCS', 'CLUSTER_DOC_RANK'], inplace=True)
+
+    # Reorder columns to match canonical schema
+    canonical_columns = [
+        "PDF_Path", "Markdown_Path", "Original_Filename", "Markdown_Filename",
+        "CAYUSE_PROJECT_NUMBER", "CAYUSE_PROPOSAL_NUMBER", "ORACLE_AWARD_NUMBER",
+        "BANNER_AWARD_UID", "LEAD_PI", "ALN_NUMBER", "ALN_PROGRAM_TITLE",
+        "ALN_SOURCE", "DOCUMENT_ACTION_TAG", "DOC_START_DATE", "DOC_END_DATE",
+        "AWARD_CUMULATIVE_START", "AWARD_ULTIMATE_END", "CHRONO_SEQUENCE",
+        "HAS_BUDGET_TABLE", "BUDGET_PAGES", "Match_Confidence", "Match_Reason"
+    ]
+    df = df[canonical_columns]
+
+    # Save to Excel & SQLite Database
+    df.to_excel(OUTPUT_EXCEL_PATH, index=False)
+    
+    import sqlite3
+    conn = sqlite3.connect(OUTPUT_SQLITE_PATH)
+    df.to_sql("tbl_Documents", conn, if_exists="replace", index=False)
+    conn.close()
+
+    # Pipeline Summary Output
+    print("\n=================== PIPELINE EXECUTION SUMMARY ===================")
+    print(f"Total Files Processed   : {len(df)}")
+    print("Match Confidence Breakdown:")
+    print(df['Match_Confidence'].value_counts().to_string())
+    print("------------------------------------------------------------------")
+    print(f"Budget Tables Tagged    : {df['HAS_BUDGET_TABLE'].sum()} documents")
+    print(f"Output Audit Excel      : {OUTPUT_EXCEL_PATH}")
+    print(f"Output Portfolio SQLite : {OUTPUT_SQLITE_PATH}")
+    print("==================================================================")
 
 if __name__ == "__main__":
     run_pipeline()
