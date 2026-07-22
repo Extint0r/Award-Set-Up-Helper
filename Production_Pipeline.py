@@ -30,6 +30,8 @@ OUTPUT_SQLITE_PATH = REVIEW_DIR / "AUDIT_INDEX_TABLE.db"
 RE_CAYUSE_PROJ = re.compile(r'(?<![A-Za-z0-9])(\d{2}-\d{4})(?![A-Za-z0-9])')
 RE_CAYUSE_PROP = re.compile(r'(?<![A-Za-z0-9])(A\d{2}-\d{4})(?![A-Za-z0-9])', re.IGNORECASE)
 RE_ORACLE_NUM  = re.compile(r'\b([1-9]\d{5})\b')
+RE_BANNER_UID  = re.compile(r'(?<![A-Za-z0-9])(R\d{4,6})(?![A-Za-z0-9])', re.IGNORECASE)
+RE_ALN         = re.compile(r'(?<!\d)(\d{2}\.\d{3})(?!\d)')
 
 # Extraction Regexes
 RE_EXECUTION_DATE = re.compile(
@@ -69,12 +71,12 @@ BUDGET_PAGE_KEYWORDS = [
 ]
 
 # Master Crosswalk Lookups
-LOOKUP_PROJ_TO_ORACLE = {}
-LOOKUP_PROP_TO_ORACLE = {}
-LOOKUP_ORACLE_TO_PROJ = {}
+LOOKUP_PROJ_TO_ORACLE: Dict[str, str] = {}
+LOOKUP_PROP_TO_ORACLE: Dict[str, str] = {}
+LOOKUP_ORACLE_TO_PROJ: Dict[str, str] = {}
 
 # ==========================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS & FORMATTERS
 # ==========================================
 def parse_dollar_amount(val_str: Any) -> float:
     """Cleans currency strings into standard float values."""
@@ -107,6 +109,37 @@ def find_markdown_file(pdf_path: Path, md_dir: Path) -> Optional[Path]:
     if matches:
         return matches[0]
     return None
+
+def format_master_yaml_header(metadata: dict) -> str:
+    """Formats the unified metadata dictionary into a clean YAML frontmatter block."""
+    lines = ["---"]
+    for k, v in metadata.items():
+        if isinstance(v, list):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {str(v).lower()}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        elif v is None:
+            lines.append(f"{k}: ''")
+        else:
+            clean_val = str(v).replace("'", "''")
+            lines.append(f"{k}: '{clean_val}'")
+    lines.append("---\n\n")
+    return "\n".join(lines)
+
+def load_aln_database(aln_csv_path: Path) -> Optional[pd.DataFrame]:
+    """Loads Assistance Listing Numbers (ALN) catalog if available."""
+    if not aln_csv_path.exists():
+        print(f"Notice: ALN database '{aln_csv_path}' not found. Program title lookups skipped.")
+        return None
+    try:
+        df_aln = pd.read_csv(aln_csv_path, dtype=str)
+        df_aln.columns = [str(c).strip().upper() for c in df_aln.columns]
+        return df_aln
+    except Exception as e:
+        print(f"Warning: Failed to load ALN database: {e}")
+        return None
 
 def load_system_baselines(triage_excel_path: Path) -> Dict[str, Dict[str, Any]]:
     """Loads baseline figures and populates multi-directional lookup maps."""
@@ -159,39 +192,30 @@ def load_system_baselines(triage_excel_path: Path) -> Dict[str, Dict[str, Any]]:
 # ==========================================
 # PASS 1: PER-DOCUMENT EXTRACTION
 # ==========================================
-def process_document_pass_1(pdf_path: Path, md_dir: Path) -> Dict[str, Any]:
+def process_document_pass_1(pdf_path: Path, md_dir: Path, aln_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     """
-    Extracts dates/financials AND writes individual Markdown files to disk.
+    Extracts dates/financials/IDs, generates Master 24-Field YAML Frontmatter, 
+    and writes standardized Markdown files to disk.
     """
     filename = pdf_path.name
     text = ""
     md_path = find_markdown_file(pdf_path, md_dir)
 
-    if md_path and md_path.exists():
-        with open(md_path, 'r', encoding='utf-8', errors='ignore') as f:
-            text = f.read()
-    else:
-        # Fallback: Extract directly from PDF AND save .md to disk for manual inspection
-        try:
-            doc = fitz.open(pdf_path)
-            text = "\n".join([page.get_text() for page in doc])
-            doc.close()
-            
-            md_dir.mkdir(parents=True, exist_ok=True)
-            target_md_path = md_dir / f"{pdf_path.stem}.md"
-            with open(target_md_path, "w", encoding="utf-8") as f:
-                f.write(f"# Document: {filename}\n\n{text}")
-            md_path = target_md_path
-        except Exception:
-            text = ""
-
-    # Identifier Extraction & Resolution
+    # 1. Filename & Identifier Parsing
     cay_proj_matches = RE_CAYUSE_PROJ.findall(filename)
     cay_prop_matches = RE_CAYUSE_PROP.findall(filename)
     oracle_matches   = RE_ORACLE_NUM.findall(filename)
+    banner_matches   = RE_BANNER_UID.findall(filename)
+    aln_matches      = RE_ALN.findall(filename)
+    
+    aln_number  = aln_matches[0] if aln_matches else ""
+    banner_uid  = banner_matches[0].upper() if banner_matches else ""
+    
+    pi_match = re.match(r'^([A-Za-z]+_[A-Za-z]+)', filename)
+    lead_pi  = pi_match.group(1) if pi_match else "EXTRACTED_PI"
 
-    cay_proj = cay_proj_matches[0] if cay_proj_matches else ""
-    cay_prop = cay_prop_matches[0] if cay_prop_matches else ""
+    cay_proj   = cay_proj_matches[0] if cay_proj_matches else ""
+    cay_prop   = cay_prop_matches[0] if cay_prop_matches else ""
     oracle_num = oracle_matches[0] if oracle_matches else ""
 
     resolved_oracle = (
@@ -206,12 +230,57 @@ def process_document_pass_1(pdf_path: Path, md_dir: Path) -> Dict[str, Any]:
         cay_prop
     )
 
-    cluster_key = (
-        resolved_oracle or 
-        resolved_cayuse or 
-        "UNKNOWN"
-    )
+    cluster_key = resolved_oracle or resolved_cayuse or "UNKNOWN"
 
+    if oracle_num:
+        match_confidence = "Active Index Match"
+        match_reason = f"Matched Oracle Award Number ({oracle_num})"
+    elif cay_proj:
+        match_confidence = "Cayuse Inference"
+        match_reason = f"Matched Cayuse Project Number ({cay_proj})"
+    else:
+        match_confidence = "Unmatched Baseline"
+        match_reason = "No direct Oracle or Cayuse ID in filename"
+
+    # 2. Extract Text Content & Identify Budget Pages
+    budget_pages: List[int] = []
+    if md_path and md_path.exists():
+        with open(md_path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+    else:
+        try:
+            doc = fitz.open(pdf_path)
+            pages_text = []
+            for pno, page in enumerate(doc, 1):
+                p_text = page.get_text()
+                pages_text.append(p_text)
+                if any(kw in p_text.lower() for kw in BUDGET_PAGE_KEYWORDS):
+                    budget_pages.append(pno)
+            text = "\n".join(pages_text)
+            doc.close()
+        except Exception:
+            text = ""
+
+    # Fallback Text Searches for Banner UID and ALN
+    if not banner_uid and text:
+        banner_txt = re.search(r'(?:Rice\s*Fund\s*No\.?|Rfund\s*#?)\s*[:\=]?\s*(R\d{4,6})\b', text, re.IGNORECASE)
+        if banner_txt:
+            banner_uid = banner_txt.group(1).upper()
+
+    if not aln_number and text:
+        cfda_txt = re.search(r'(?:CFDA|ALN)\s*Number\s*[:\=]?\s*(\d{2}\.\d{3})', text, re.IGNORECASE)
+        if cfda_txt:
+            aln_number = cfda_txt.group(1)
+
+    # ALN Catalog Lookup
+    aln_title = "N/A"
+    aln_source = "N/A"
+    if aln_df is not None and not aln_df.empty and aln_number:
+        match = aln_df[aln_df['ALN'] == aln_number] if 'ALN' in aln_df.columns else pd.DataFrame()
+        if not match.empty:
+            aln_title = match.iloc[0].get('ALN_PROGRAM_TITLE', 'N/A')
+
+    # 3. Financial & Date Pattern Extraction
     header_scope = text[:4000] if text else ""
     
     exec_match = RE_EXECUTION_DATE.search(header_scope)
@@ -227,14 +296,12 @@ def process_document_pass_1(pdf_path: Path, md_dir: Path) -> Dict[str, Any]:
     ceiling_match = RE_CEILING_AMOUNT.search(header_scope)
     doc_ceiling = parse_dollar_amount(ceiling_match.group(1)) if ceiling_match else 0.0
 
-    has_budget_table = False
-    table_total = 0.0
-    table_indirect = 0.0
-    table_direct = 0.0
+    has_budget_table = len(budget_pages) > 0 or (bool(text) and any(kw in text.lower() for kw in BUDGET_PAGE_KEYWORDS))
+    table_total, table_indirect, table_direct = 0.0, 0.0, 0.0
     budget_split_status = "NO_BUDGET_TABLE"
 
-    if text and any(kw in text.lower() for kw in BUDGET_PAGE_KEYWORDS):
-        has_budget_table = True
+    if has_budget_table:
+        # Strategy A: Standard Inline Key-Value Regex (Horizontal Tables)
         tot_match = RE_BUDGET_TOTAL.search(text)
         ind_match = RE_INDIRECT_COST.search(text)
         
@@ -242,13 +309,87 @@ def process_document_pass_1(pdf_path: Path, md_dir: Path) -> Dict[str, Any]:
             table_total = parse_dollar_amount(tot_match.group(1))
         if ind_match:
             table_indirect = parse_dollar_amount(ind_match.group(1))
-            
+
+        # Strategy B: Vertical Award History Sheet Parser (OSR Banner Reports)
+        if "Award History Sheet" in text:
+            # Parse Cumulative Project Ceiling if not already found
+            cum_match = re.search(r'Cumulative\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)', text)
+            if cum_match:
+                doc_ceiling = parse_dollar_amount(cum_match.group(3))
+
+            # Parse Action Row: Start Date, End Date, Award/Execution Date, F&A %, Direct, Indirect, Total
+            vertical_action_matches = re.findall(
+                r'(\d{2}/\d{2}/\d{4})\s*[\r\n]+\s*(\d{2}/\d{2}/\d{4})\s*[\r\n]+\s*(\d{2}/\d{2}/\d{4})\s*[\r\n]+\s*(\d{1,2}(?:\.\d+)?%)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)',
+                text
+            )
+            if vertical_action_matches:
+                start_str, end_str, exec_str, _, dc_str, fa_str, tot_str = vertical_action_matches[-1]
+                if not doc_start_date:
+                    doc_start_date = parse_date(start_str)
+                if not doc_end_date:
+                    doc_end_date = parse_date(end_str)
+                if not execution_date:
+                    execution_date = parse_date(exec_str)
+                table_direct = parse_dollar_amount(dc_str)
+                table_indirect = parse_dollar_amount(fa_str)
+                table_total = parse_dollar_amount(tot_str)
+
+        # Final Financial Reconciliation & Fallback
         if table_total > 0:
-            table_direct = max(0.0, table_total - table_indirect)
-            if abs(table_total - delta_obligated) < 1.0:
-                budget_split_status = "MATCHED_HEADER"
-            else:
-                budget_split_status = "PARTIAL_OR_UNMATCHED"
+            if table_direct == 0.0:
+                table_direct = max(0.0, table_total - table_indirect)
+            
+            # If front-page header missed the action amount, populate it from the budget table
+            if delta_obligated == 0.0:
+                delta_obligated = table_total
+
+            budget_split_status = "MATCHED_HEADER" if abs(table_total - delta_obligated) < 1.0 else "PARTIAL_OR_UNMATCHED"
+
+    action_tag = "Standard Award"
+    if "RPPR" in filename or "PR" in filename:
+        action_tag = "PR"
+    elif "Amd" in filename or "Amendment" in filename:
+        action_tag = "Amd"
+    elif "OtherDoc" in filename:
+        action_tag = "OtherDoc"
+
+    # 4. Assemble Master Metadata Schema
+    master_metadata = {
+        "original_filename": filename,
+        "award_cluster_key": cluster_key,
+        "oracle_award_number": resolved_oracle,
+        "cayuse_project_number": resolved_cayuse,
+        "cayuse_proposal_number": cay_prop,
+        "banner_award_uid": banner_uid,
+        "lead_pi": lead_pi,
+        "match_confidence": match_confidence,
+        "match_reason": match_reason,
+        "action_tag": action_tag,
+        "aln_number": aln_number,
+        "aln_program_title": aln_title,
+        "aln_source": aln_source,
+        "execution_date": execution_date.strftime("%Y-%m-%d") if execution_date else "",
+        "doc_start_date": doc_start_date.strftime("%Y-%m-%d") if doc_start_date else "",
+        "doc_end_date": doc_end_date.strftime("%Y-%m-%d") if doc_end_date else "",
+        "delta_obligated": delta_obligated,
+        "doc_ceiling": doc_ceiling,
+        "has_budget_table": has_budget_table,
+        "budget_pages": budget_pages,
+        "budget_split_status": budget_split_status,
+        "table_total": table_total,
+        "table_direct": table_direct,
+        "table_indirect": table_indirect
+    }
+
+    # 5. Write Standardized Markdown with Master YAML Header if missing
+    if not (md_path and md_path.exists()):
+        md_dir.mkdir(parents=True, exist_ok=True)
+        target_md_path = md_dir / f"{pdf_path.stem}.md"
+        header_str = format_master_yaml_header(master_metadata)
+        
+        with open(target_md_path, "w", encoding="utf-8") as f:
+            f.write(f"{header_str}# Document: {filename}\n\n{text}")
+        md_path = target_md_path
 
     return {
         "PDF_Path": str(pdf_path),
@@ -257,6 +398,7 @@ def process_document_pass_1(pdf_path: Path, md_dir: Path) -> Dict[str, Any]:
         "AWARD_CLUSTER_KEY": cluster_key,
         "ORACLE_AWARD_NUMBER": resolved_oracle,
         "CAYUSE_PROJECT_NUMBER": resolved_cayuse,
+        "BANNER_AWARD_UID": banner_uid,
         "EXECUTION_DATE": execution_date,
         "DOC_START_DATE": doc_start_date,
         "DOC_END_DATE": doc_end_date,
@@ -395,6 +537,7 @@ def initialize_database(db_path: Path):
         AWARD_CLUSTER_KEY TEXT,
         ORACLE_AWARD_NUMBER TEXT,
         CAYUSE_PROJECT_NUMBER TEXT,
+        BANNER_AWARD_UID TEXT,
         EXECUTION_DATE TEXT,
         DOC_START_DATE TEXT,
         DOC_END_DATE TEXT,
@@ -441,8 +584,9 @@ def main():
     print("=== STARTING PRODUCTION 3-WAY RECONCILIATION PIPELINE ===")
     initialize_database(OUTPUT_SQLITE_PATH)
     
-    # 1. Load Real System Baselines from Excel
+    # 1. Load Real System Baselines & ALN Catalog
     system_baselines = load_system_baselines(TRIAGE_EXCEL_PATH)
+    aln_df = load_aln_database(ALN_CSV_PATH)
     
     # 2. Discover and Process Actual Document Corpus
     if not PDF_SOURCE_DIR.exists():
@@ -454,7 +598,7 @@ def main():
     
     extracted_documents = []
     for idx, pdf_path in enumerate(pdf_files, 1):
-        doc_data = process_document_pass_1(pdf_path, MD_OUTPUT_DIR)
+        doc_data = process_document_pass_1(pdf_path, MD_OUTPUT_DIR, aln_df)
         extracted_documents.append(doc_data)
         
         if idx % 1000 == 0 or idx == len(pdf_files):
@@ -465,7 +609,7 @@ def main():
         return
 
     # 3. Group Extracted Records by Award Cluster Key
-    clusters = {}
+    clusters: Dict[str, List[Dict[str, Any]]] = {}
     for doc in extracted_documents:
         ckey = doc["AWARD_CLUSTER_KEY"]
         clusters.setdefault(ckey, []).append(doc)
