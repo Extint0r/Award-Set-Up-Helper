@@ -1,19 +1,18 @@
 import os
 import re
-import glob
-import fitz  # PyMuPDF
-import pandas as pd
-import yaml
+import fitz  # PyMuPDF fallback
 import sqlite3
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List, Any, Optional
 
-# ==============================================================================
-# 0. TERMINAL WARNING SUPPRESSION & PATH CONFIGURATION
-# ==============================================================================
+# Suppress PyMuPDF warnings
 fitz.TOOLS.mupdf_display_errors(False)
 
-# Path & Environment Configuration
+# ==========================================
+# PATH & ENVIRONMENT CONFIGURATION
+# ==========================================
 TRIAGE_EXCEL_PATH = Path(r"2026_7_20_CAYUSE_ORACLE_TRIAGE.xlsx")
 ALN_CSV_PATH      = Path(r"ALN.csv")
 
@@ -22,419 +21,484 @@ MD_OUTPUT_DIR     = Path(r"D:\0-Batch-AWARDS\processed_files\Markdown")
 REVIEW_DIR        = Path(r"D:\0-Batch-AWARDS\processed_files\Review")
 
 # Output Artifacts
-OUTPUT_EXCEL_PATH = REVIEW_DIR / "AUDIT_INDEX_TABLE.xlsx"
+OUTPUT_EXCEL_PATH  = REVIEW_DIR / "AUDIT_INDEX_TABLE.xlsx"
 OUTPUT_SQLITE_PATH = REVIEW_DIR / "AUDIT_INDEX_TABLE.db"
 
-# Ensure output directories exist
-MD_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-REVIEW_DIR.mkdir(parents=True, exist_ok=True)
-
-# ==============================================================================
-# 1. REGEX PATTERNS & BOUNDED MATCHING ENGINES
-# ==============================================================================
-# Bounded Identifiers
+# ==========================================
+# REGEX PATTERNS & MATCHING ENGINES
+# ==========================================
 RE_CAYUSE_PROJ = re.compile(r'(?<![A-Za-z0-9])(\d{2}-\d{4})(?![A-Za-z0-9])')
 RE_CAYUSE_PROP = re.compile(r'(?<![A-Za-z0-9])(A\d{2}-\d{4})(?![A-Za-z0-9])', re.IGNORECASE)
-
-# Oracle Award Numbers MUST start with 1-9 (No leading zeros permitted)
 RE_ORACLE_NUM  = re.compile(r'\b([1-9]\d{5})\b')
 
-# Banner UIDs MUST start with R, total 6 chars, contain >=1 digit, and handle _ boundaries
-RE_BANNER_UID  = re.compile(r'(?<![A-Za-z0-9])(R(?=[A-Za-z0-9]{0,4}[0-9])[0-9A-Za-z]{5})(?![A-Za-z0-9])', re.IGNORECASE)
-
-# Assistance Listing Number (ALN / CFDA) Regex Engine (e.g., 12.431, 47.049)
-RE_ALN_NUM     = re.compile(r'(?<![A-Za-z0-9])(\d{2}\.\d{3})(?![A-Za-z0-9])')
-
-# Document Action Tags
-RE_ACTION_TAGS = re.compile(
-    r'\b(SubA(?:ward)?|SubB|Subgrant|Amd\s*\d*|Amendment\s*\d*|NCE|No-Cost\s*Ext\w*|'
-    r'inv(?:ention)?\s*rpt|progress\s*rpt|PR|Y\d+-\d+\s*PRs?|MOU|A-133|Supplement)\b', 
+# Extraction Regexes
+RE_EXECUTION_DATE = re.compile(
+    r'(?:Date|Execution\s*Date|Notice\s*Date|Award\s*Date)\s*[:\=]?\s*(\d{1,2}/\d{1,2}/\d{2,4})',
     re.IGNORECASE
 )
 
-# Date Search Patterns
-RE_DATE_GENERIC = re.compile(
-    r'\b(\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}|'
-    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4})\b', 
+RE_DATE_RANGE = re.compile(
+    r'(?:Project\s*Period|Award\s*Period|Performance\s*Period|Grant\s*Period)\s*[:\=]?\s*'
+    r'(\d{1,2}/\d{1,2}/\d{2,4})\s*[-–—\s+to\s+]+\s*(\d{1,2}/\d{1,2}/\d{2,4})',
     re.IGNORECASE
 )
 
-# Budget Keyword Signals (Strategy 2 Tagging)
+RE_CEILING_AMOUNT = re.compile(
+    r'(?:Project\s*Total\s*Amount|Total\s*Award\s*Amount|Total\s*Ceiling|Award\s*Ceiling|Total\s*Project\s*Ceiling)\s*(?:\([^)]*\))?\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)',
+    re.IGNORECASE
+)
+
+RE_OBLIGATED_ACTION = re.compile(
+    r'(?:Current\s*Action.*?totaling|Obligated\s*Amount|Amount\s*Awarded\s*This\s*Action|Funding\s*This\s*Action|Action\s*Amount|This\s*Action)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)',
+    re.IGNORECASE
+)
+
+RE_BUDGET_TOTAL = re.compile(
+    r'(?:Total\s*Budget|Total\s*Costs|Total\s*Amount|Total\s*Direct\s*and\s*Indirect)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)',
+    re.IGNORECASE
+)
+
+RE_INDIRECT_COST = re.compile(
+    r'(?:Indirect\s*Costs?|F&A\s*Costs?|Facilities\s*&\s*Admin|Overhead)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)',
+    re.IGNORECASE
+)
+
 BUDGET_PAGE_KEYWORDS = [
-    'budget summary', 'direct cost', 'indirect cost', 'f&a rate',
-    'fringe benefit', 'personnel justification', 'total requested',
-    'modified total direct', 'equipment', 'travel', 'contractual',
-    'subaward budget', 'budget justification'
+    "direct cost", "f&a", "facilities and administrative", "f&a rate", 
+    "f&a cost", "indirect cost", "total direct", "modified total direct"
 ]
 
-# Common Federal ALN Reference Map (Fallback when ALN.csv is absent)
-FALLBACK_ALN_MAP = {
-    "12.431": ("Basic Scientific Research", "Department of Defense (DOD)"),
-    "12.300": ("Basic and Applied Scientific Research", "Department of Defense (DOD)"),
-    "12.800": ("Air Force Defense Research Sciences Program", "Department of Defense (DOD)"),
-    "47.041": ("Engineering Grants", "National Science Foundation (NSF)"),
-    "47.049": ("Mathematical and Physical Sciences", "National Science Foundation (NSF)"),
-    "47.050": ("Geosciences", "National Science Foundation (NSF)"),
-    "47.070": ("Computer and Information Science and Engineering", "National Science Foundation (NSF)"),
-    "47.074": ("Biological Sciences", "National Science Foundation (NSF)"),
-    "47.075": ("Social, Behavioral, and Economic Sciences", "National Science Foundation (NSF)"),
-    "47.076": ("Education and Human Resources", "National Science Foundation (NSF)"),
-    "43.001": ("Aeronautics", "National Aeronautics and Space Administration (NASA)"),
-    "81.049": ("Office of Science Financial Assistance Program", "Department of Energy (DOE)"),
-    "93.853": ("Extramural Research Programs in the Neurosciences", "National Institutes of Health (NIH)"),
-    "93.855": ("Allergy and Infectious Diseases Research", "National Institutes of Health (NIH)"),
-    "93.859": ("Biomedical Research and Research Training", "National Institutes of Health (NIH)")
-}
-
-# ==============================================================================
-# 2. MASTER LOOKUP DATA INGESTION
-# ==============================================================================
+# Master Crosswalk Lookups
 LOOKUP_PROJ_TO_ORACLE = {}
 LOOKUP_PROP_TO_ORACLE = {}
-LOOKUP_BANNER_TO_ORACLE = {}
-LOOKUP_ORACLE_TO_PI = {}
-LOOKUP_ORACLE_TO_ALN = {}
-LOOKUP_ALN_DETAILS = {}
+LOOKUP_ORACLE_TO_PROJ = {}
 
-def load_master_lookups():
-    """Loads Master Triage Excel and ALN Reference Data into in-memory dictionaries."""
-    global LOOKUP_PROJ_TO_ORACLE, LOOKUP_PROP_TO_ORACLE
-    global LOOKUP_BANNER_TO_ORACLE, LOOKUP_ORACLE_TO_PI, LOOKUP_ORACLE_TO_ALN
-    global LOOKUP_ALN_DETAILS
-    
-    # 1. Load ALN Reference File if present
-    if ALN_CSV_PATH.exists():
-        try:
-            df_aln = pd.read_csv(ALN_CSV_PATH)
-            df_aln.columns = [str(c).strip().upper() for c in df_aln.columns]
-            for _, r in df_aln.iterrows():
-                code  = str(r.get('ALN_NUMBER', r.get('CFDA', ''))).strip()
-                title = str(r.get('ALN_PROGRAM_TITLE', r.get('PROGRAM_TITLE', ''))).strip()
-                src   = str(r.get('ALN_SOURCE', r.get('AGENCY', ''))).strip()
-                if code and code != 'nan':
-                    LOOKUP_ALN_DETAILS[code] = (title, src)
-            print(f"✅ Loaded {len(LOOKUP_ALN_DETAILS)} ALN reference definitions from {ALN_CSV_PATH.name}.")
-        except Exception as e:
-            print(f"⚠️ Warning loading ALN CSV: {e}")
-
-    # 2. Load Master Triage File
-    if TRIAGE_EXCEL_PATH.exists():
-        try:
-            df_tr = pd.read_excel(TRIAGE_EXCEL_PATH)
-            df_tr.columns = [str(c).strip().upper() for c in df_tr.columns]
-            
-            for _, r in df_tr.iterrows():
-                oracle = str(r.get('ORACLE_AWARD_NUMBER', '')).split('.')[0].strip()
-                proj   = str(r.get('CAYUSE_PROJECT_NUMBER', '')).strip()
-                prop   = str(r.get('CAYUSE_PROPOSAL_NUMBER', '')).strip()
-                banner = str(r.get('BANNER_AWARD_UID', '')).strip().upper()
-                pi     = str(r.get('LEAD_PI', '')).strip()
-                aln    = str(r.get('ALN_NUMBER', '')).strip()
-
-                if oracle and oracle != 'nan' and RE_ORACLE_NUM.match(oracle):
-                    if proj and proj != 'nan':
-                        LOOKUP_PROJ_TO_ORACLE[proj] = oracle
-                    if prop and prop != 'nan':
-                        LOOKUP_PROP_TO_ORACLE[prop] = oracle
-                    if banner and banner != 'nan':
-                        LOOKUP_BANNER_TO_ORACLE[banner] = oracle
-                    if pi and pi != 'nan':
-                        LOOKUP_ORACLE_TO_PI[oracle] = pi
-                    if aln and aln != 'nan':
-                        LOOKUP_ORACLE_TO_ALN[oracle] = aln
-                        
-            print(f"✅ Loaded Master Triage Lookups: {len(LOOKUP_PROJ_TO_ORACLE)} Project mappings, {len(LOOKUP_BANNER_TO_ORACLE)} Banner mappings.")
-        except Exception as e:
-            print(f"⚠️ Warning loading Master Triage Excel: {e}")
-    else:
-        print(f"⚠️ Master Triage File not found at {TRIAGE_EXCEL_PATH}. Proceeding with extraction rules.")
-
-# ==============================================================================
-# 3. HELPER FUNCTIONS
-# ==============================================================================
-def normalize_date(date_str: str) -> str:
-    """Parses date string into YYYY-MM-DD format with 1980-2035 sanity bounds."""
-    if not date_str:
-        return ""
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def parse_dollar_amount(val_str: Any) -> float:
+    """Cleans currency strings into standard float values."""
+    if pd.isna(val_str) or val_str is None:
+        return 0.0
     try:
-        dt = pd.to_datetime(date_str, errors='coerce')
-        if pd.notnull(dt) and 1980 <= dt.year <= 2035:
-            return dt.strftime('%Y-%m-%d')
-    except Exception:
-        pass
-    return ""
+        clean_str = re.sub(r'[^\d.]', '', str(val_str))
+        return float(clean_str) if clean_str else 0.0
+    except ValueError:
+        return 0.0
 
-def resolve_aln_details(aln_code: str):
-    """Resolves Program Title and Source for a given ALN number."""
-    if not aln_code or aln_code == "N/A":
-        return "N/A", "N/A"
+def parse_date(date_str: Any) -> Optional[datetime]:
+    """Parses date string into standard datetime object."""
+    if pd.isna(date_str) or not date_str:
+        return None
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(date_str).strip(), fmt)
+        except ValueError:
+            pass
+    return None
+
+def find_markdown_file(pdf_path: Path, md_dir: Path) -> Optional[Path]:
+    """Finds existing Markdown file regardless of prefix variations."""
+    exact_path = md_dir / f"{pdf_path.stem}.md"
+    if exact_path.exists():
+        return exact_path
     
-    if aln_code in LOOKUP_ALN_DETAILS:
-        return LOOKUP_ALN_DETAILS[aln_code]
-    elif aln_code in FALLBACK_ALN_MAP:
-        return FALLBACK_ALN_MAP[aln_code]
+    matches = list(md_dir.glob(f"*{pdf_path.stem}.md"))
+    if matches:
+        return matches[0]
+    return None
+
+def load_system_baselines(triage_excel_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Loads baseline figures and populates multi-directional lookup maps."""
+    global LOOKUP_PROJ_TO_ORACLE, LOOKUP_PROP_TO_ORACLE, LOOKUP_ORACLE_TO_PROJ
     
-    return "N/A", "N/A"
-
-def extract_action_tags(filename: str, text_head: str) -> str:
-    """Extracts administrative action tags from filename and text."""
-    matches = set()
-    for m in RE_ACTION_TAGS.findall(filename):
-        matches.add(m.strip().replace(" ", ""))
-    for m in RE_ACTION_TAGS.findall(text_head[:1000]):
-        matches.add(m.strip().replace(" ", ""))
-    return "; ".join(sorted(matches)) if matches else "Standard Award"
-
-def scan_dates_from_text(text: str):
-    """Scans header text for performance start and end dates."""
-    start_date, end_date = "", ""
-    lines = text.split('\n')
+    if not triage_excel_path.exists():
+        print(f"Warning: Triage baseline file '{triage_excel_path}' not found.")
+        return {}
     
-    for line in lines[:100]:
-        line_lower = line.lower()
-        if any(kw in line_lower for kw in ['start date', 'effective date', 'period of performance start', 'from']):
-            m = RE_DATE_GENERIC.search(line)
-            if m and not start_date:
-                start_date = normalize_date(m.group(1))
-        if any(kw in line_lower for kw in ['end date', 'expiration date', 'period of performance end', 'through', 'valid to']):
-            m = RE_DATE_GENERIC.search(line)
-            if m and not end_date:
-                end_date = normalize_date(m.group(1))
-                
-    return start_date, end_date
+    try:
+        xls = pd.ExcelFile(triage_excel_path)
+        sheet_to_load = 'TRIAGE' if 'TRIAGE' in xls.sheet_names else ('MASTER' if 'MASTER' in xls.sheet_names else xls.sheet_names[0])
+        
+        df = pd.read_excel(triage_excel_path, sheet_name=sheet_to_load)
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        
+        baselines = {}
+        for _, row in df.iterrows():
+            oracle_num = str(row.get("ORACLE_AWARD_NUMBER", "")).split('.')[0].strip()
+            cayuse_proj = str(row.get("CAYUSE_PROJECT_NUMBER", "")).strip()
+            cayuse_prop = str(row.get("CAYUSE_PROPOSAL_NUMBER", "")).strip()
 
-def detect_budget_pages(doc: fitz.Document):
-    """Identifies candidate pages containing budget schedules (Strategy 2)."""
-    budget_pages = []
-    for idx, page in enumerate(doc):
-        p_text = page.get_text().lower()
-        matches = sum(1 for kw in BUDGET_PAGE_KEYWORDS if kw in p_text)
-        if matches >= 2:
-            budget_pages.append(idx + 1)
-    return len(budget_pages) > 0, budget_pages
+            if oracle_num and oracle_num not in ('nan', 'None', ''):
+                if cayuse_proj and cayuse_proj not in ('nan', 'None', ''):
+                    LOOKUP_PROJ_TO_ORACLE[cayuse_proj] = oracle_num
+                    LOOKUP_ORACLE_TO_PROJ[oracle_num] = cayuse_proj
+                if cayuse_prop and cayuse_prop not in ('nan', 'None', ''):
+                    LOOKUP_PROP_TO_ORACLE[cayuse_prop] = oracle_num
 
-# ==============================================================================
-# 4. PASS 1: PER-FILE EXTRACTION & RESOLUTION ENGINE
-# ==============================================================================
-def process_pdf_pass_1(pdf_path: Path) -> dict:
+            data = {
+                "ORACLE_AWARD_NUMBER": oracle_num if oracle_num not in ('nan', 'None') else "",
+                "CAYUSE_PROJECT_NUMBER": cayuse_proj if cayuse_proj not in ('nan', 'None') else "",
+                "CAYUSE_OBLIGATED": parse_dollar_amount(row.get("CAYUSE_OBLIGATED_TOTAL", 0)),
+                "ORACLE_OBLIGATED": parse_dollar_amount(row.get("ORACLE_BUDGET_BURDENED_COST", row.get("ORACLE_HARD_LIMIT", 0))),
+                "CAYUSE_TOTAL_AMOUNT": parse_dollar_amount(row.get("CAYUSE_TOTAL_AMOUNT", 0)),
+                "ORACLE_HEADER_HARD_LIMIT": parse_dollar_amount(row.get("ORACLE_HEADER_HARD_LIMIT", 0))
+            }
+
+            if oracle_num and oracle_num not in ('nan', 'None', ''):
+                baselines[oracle_num] = data
+            if cayuse_proj and cayuse_proj not in ('nan', 'None', ''):
+                baselines[cayuse_proj] = data
+
+        print(f"Loaded {len(baselines)} baseline entries from sheet '{sheet_to_load}'.")
+        return baselines
+    except Exception as e:
+        print(f"Error loading baseline file '{triage_excel_path}': {e}")
+        return {}
+
+# ==========================================
+# PASS 1: PER-DOCUMENT EXTRACTION
+# ==========================================
+def process_document_pass_1(pdf_path: Path, md_dir: Path) -> Dict[str, Any]:
+    """
+    Extracts dates/financials AND writes individual Markdown files to disk.
+    """
     filename = pdf_path.name
-    doc = fitz.open(pdf_path)
+    text = ""
+    md_path = find_markdown_file(pdf_path, md_dir)
+
+    if md_path and md_path.exists():
+        with open(md_path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+    else:
+        # Fallback: Extract directly from PDF AND save .md to disk for manual inspection
+        try:
+            doc = fitz.open(pdf_path)
+            text = "\n".join([page.get_text() for page in doc])
+            doc.close()
+            
+            md_dir.mkdir(parents=True, exist_ok=True)
+            target_md_path = md_dir / f"{pdf_path.stem}.md"
+            with open(target_md_path, "w", encoding="utf-8") as f:
+                f.write(f"# Document: {filename}\n\n{text}")
+            md_path = target_md_path
+        except Exception:
+            text = ""
+
+    # Identifier Extraction & Resolution
+    cay_proj_matches = RE_CAYUSE_PROJ.findall(filename)
+    cay_prop_matches = RE_CAYUSE_PROP.findall(filename)
+    oracle_matches   = RE_ORACLE_NUM.findall(filename)
+
+    cay_proj = cay_proj_matches[0] if cay_proj_matches else ""
+    cay_prop = cay_prop_matches[0] if cay_prop_matches else ""
+    oracle_num = oracle_matches[0] if oracle_matches else ""
+
+    resolved_oracle = (
+        oracle_num or 
+        LOOKUP_PROJ_TO_ORACLE.get(cay_proj, "") or 
+        LOOKUP_PROP_TO_ORACLE.get(cay_prop, "")
+    )
     
-    header_text = ""
-    for i in range(min(3, len(doc))):
-        header_text += doc[i].get_text() + "\n"
-        
-    full_text = "\n".join([page.get_text() for page in doc])
+    resolved_cayuse = (
+        cay_proj or 
+        LOOKUP_ORACLE_TO_PROJ.get(oracle_num, "") or 
+        cay_prop
+    )
 
-    # --- Step 1: Identifier & ALN Extraction from Filename ---
-    fn_cayuse_proj = RE_CAYUSE_PROJ.findall(filename)
-    fn_cayuse_prop = RE_CAYUSE_PROP.findall(filename)
-    fn_oracle_num  = RE_ORACLE_NUM.findall(filename)
-    fn_banner_uid  = RE_BANNER_UID.findall(filename)
-    fn_aln_num     = RE_ALN_NUM.findall(filename)
+    cluster_key = (
+        resolved_oracle or 
+        resolved_cayuse or 
+        "UNKNOWN"
+    )
 
-    cay_proj_val = fn_cayuse_proj[0] if fn_cayuse_proj else ""
-    cay_prop_val = fn_cayuse_prop[0] if fn_cayuse_prop else ""
-    oracle_val   = fn_oracle_num[0] if fn_oracle_num else ""
-    banner_val   = fn_banner_uid[0].upper() if fn_banner_uid else ""
-    aln_val      = fn_aln_num[0] if fn_aln_num else ""
-
-    # --- Step 2: Master Lookup Resolution ---
-    resolved_oracle = oracle_val
-    if not resolved_oracle:
-        if cay_proj_val in LOOKUP_PROJ_TO_ORACLE:
-            resolved_oracle = LOOKUP_PROJ_TO_ORACLE[cay_proj_val]
-        elif cay_prop_val in LOOKUP_PROP_TO_ORACLE:
-            resolved_oracle = LOOKUP_PROP_TO_ORACLE[cay_prop_val]
-        elif banner_val in LOOKUP_BANNER_TO_ORACLE:
-            resolved_oracle = LOOKUP_BANNER_TO_ORACLE[banner_val]
-
-    # --- Step 3: Constrained Header Text Fallback ---
-    if not resolved_oracle and not cay_proj_val and not banner_val:
-        txt_cayuse_proj = RE_CAYUSE_PROJ.findall(header_text)
-        txt_cayuse_prop = RE_CAYUSE_PROP.findall(header_text)
-        txt_oracle_num  = RE_ORACLE_NUM.findall(header_text)
-        txt_banner_uid  = RE_BANNER_UID.findall(header_text)
-
-        cay_proj_val = cay_proj_val or (txt_cayuse_proj[0] if txt_cayuse_proj else "")
-        cay_prop_val = cay_prop_val or (txt_cayuse_prop[0] if txt_cayuse_prop else "")
-        banner_val   = banner_val or (txt_banner_uid[0].upper() if txt_banner_uid else "")
-        
-        if cay_proj_val in LOOKUP_PROJ_TO_ORACLE:
-            resolved_oracle = LOOKUP_PROJ_TO_ORACLE[cay_proj_val]
-        elif txt_oracle_num:
-            resolved_oracle = txt_oracle_num[0]
-
-    # Fallback for ALN from Header Text or Master Table if missing from filename
-    if not aln_val:
-        txt_aln_num = RE_ALN_NUM.findall(header_text)
-        if txt_aln_num:
-            aln_val = txt_aln_num[0]
-        elif resolved_oracle in LOOKUP_ORACLE_TO_ALN:
-            aln_val = LOOKUP_ORACLE_TO_ALN[resolved_oracle]
-        else:
-            aln_val = "N/A"
-
-    # --- Step 4: Metadata Reconciliation ---
-    lead_pi = LOOKUP_ORACLE_TO_PI.get(resolved_oracle, "EXTRACTED_PI")
-    aln_title, aln_source = resolve_aln_details(aln_val)
-
-    # --- Step 5: Action Tag & Date Extraction ---
-    action_tag = extract_action_tags(filename, header_text)
-    doc_start, doc_end = scan_dates_from_text(header_text)
-    has_budget, budget_pages = detect_budget_pages(doc)
-
-    # --- Step 6: Match Confidence & Canonical Cluster Key ---
-    match_conf = "Unmatched"
-    match_reason = "No known master key or legacy UID matched"
+    header_scope = text[:4000] if text else ""
     
-    if resolved_oracle:
-        match_conf = "Active Index Match"
-        match_reason = f"Matched Oracle Award Number ({resolved_oracle})"
-    elif banner_val:
-        match_conf = "Legacy Banner Match"
-        match_reason = f"Matched Legacy Banner Award UID ({banner_val})"
-    elif cay_proj_val:
-        match_conf = "Cayuse Inference"
-        match_reason = f"Matched Cayuse Project Number ({cay_proj_val})"
-    elif cay_prop_val:
-        match_conf = "Cayuse Proposal Match"
-        match_reason = f"Matched Cayuse Proposal Number ({cay_prop_val})"
+    exec_match = RE_EXECUTION_DATE.search(header_scope)
+    execution_date = parse_date(exec_match.group(1)) if exec_match else None
+    
+    range_match = RE_DATE_RANGE.search(header_scope)
+    doc_start_date = parse_date(range_match.group(1)) if range_match else None
+    doc_end_date = parse_date(range_match.group(2)) if range_match else None
+    
+    obligated_match = RE_OBLIGATED_ACTION.search(header_scope)
+    delta_obligated = parse_dollar_amount(obligated_match.group(1)) if obligated_match else 0.0
+    
+    ceiling_match = RE_CEILING_AMOUNT.search(header_scope)
+    doc_ceiling = parse_dollar_amount(ceiling_match.group(1)) if ceiling_match else 0.0
 
-    cluster_key = resolved_oracle or banner_val or cay_proj_val or cay_prop_val or "UNMATCHED"
+    has_budget_table = False
+    table_total = 0.0
+    table_indirect = 0.0
+    table_direct = 0.0
+    budget_split_status = "NO_BUDGET_TABLE"
 
-    # Generate Structured Markdown with Updated Frontmatter
-    md_filename = f"{match_conf.replace(' ', '_')}_{pdf_path.stem}.md"
-    md_path = MD_OUTPUT_DIR / md_filename
-
-    frontmatter = {
-        "original_filename": filename,
-        "cayuse_project_number": cay_proj_val,
-        "cayuse_proposal_number": cay_prop_val,
-        "oracle_award_number": resolved_oracle,
-        "banner_award_uid": banner_val,
-        "lead_pi": lead_pi,
-        "aln_number": aln_val,
-        "aln_program_title": aln_title,
-        "aln_source": aln_source,
-        "action_tag": action_tag,
-        "doc_start_date": doc_start,
-        "doc_end_date": doc_end,
-        "has_budget_table": has_budget,
-        "budget_pages": budget_pages,
-        "match_confidence": match_conf,
-        "match_reason": match_reason
-    }
-
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write("---\n")
-        yaml.dump(frontmatter, f, default_flow_style=False)
-        f.write("---\n\n")
-        f.write(f"# Document: {filename}\n\n")
-        f.write(full_text)
-
-    doc.close()
+    if text and any(kw in text.lower() for kw in BUDGET_PAGE_KEYWORDS):
+        has_budget_table = True
+        tot_match = RE_BUDGET_TOTAL.search(text)
+        ind_match = RE_INDIRECT_COST.search(text)
+        
+        if tot_match:
+            table_total = parse_dollar_amount(tot_match.group(1))
+        if ind_match:
+            table_indirect = parse_dollar_amount(ind_match.group(1))
+            
+        if table_total > 0:
+            table_direct = max(0.0, table_total - table_indirect)
+            if abs(table_total - delta_obligated) < 1.0:
+                budget_split_status = "MATCHED_HEADER"
+            else:
+                budget_split_status = "PARTIAL_OR_UNMATCHED"
 
     return {
         "PDF_Path": str(pdf_path),
-        "Markdown_Path": str(md_path),
-        "Original_Filename": filename,
-        "Markdown_Filename": md_filename,
-        "CAYUSE_PROJECT_NUMBER": cay_proj_val,
-        "CAYUSE_PROPOSAL_NUMBER": cay_prop_val,
-        "ORACLE_AWARD_NUMBER": resolved_oracle,
-        "BANNER_AWARD_UID": banner_val,
-        "LEAD_PI": lead_pi,
-        "ALN_NUMBER": aln_val,
-        "ALN_PROGRAM_TITLE": aln_title,
-        "ALN_SOURCE": aln_source,
-        "DOCUMENT_ACTION_TAG": action_tag,
-        "DOC_START_DATE": doc_start,
-        "DOC_END_DATE": doc_end,
+        "Markdown_Path": str(md_path) if md_path else "",
+        "Filename": filename,
         "AWARD_CLUSTER_KEY": cluster_key,
-        "HAS_BUDGET_TABLE": has_budget,
-        "BUDGET_PAGES": str(budget_pages),
-        "Match_Confidence": match_conf,
-        "Match_Reason": match_reason
+        "ORACLE_AWARD_NUMBER": resolved_oracle,
+        "CAYUSE_PROJECT_NUMBER": resolved_cayuse,
+        "EXECUTION_DATE": execution_date,
+        "DOC_START_DATE": doc_start_date,
+        "DOC_END_DATE": doc_end_date,
+        "DELTA_OBLIGATED": delta_obligated,
+        "DOC_CEILING": doc_ceiling,
+        "HAS_BUDGET_TABLE": has_budget_table,
+        "TABLE_TOTAL": table_total,
+        "TABLE_DIRECT": table_direct,
+        "TABLE_INDIRECT": table_indirect,
+        "BUDGET_SPLIT_STATUS": budget_split_status
     }
 
-# ==============================================================================
-# 5. PASS 2: PORTFOLIO AGGREGATION & RELATIONAL INDEX BUILD
-# ==============================================================================
-def run_pipeline():
-    print("🚀 Initializing Pipeline Processing...")
+# ==========================================
+# PASS 2 & 3: SYNTHESIS & RECONCILIATION
+# ==========================================
+def synthesize_portfolio_pass_2(cluster_docs: List[Dict[str, Any]], system_baselines: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregates portfolio data and generates audit verdicts with clear reasons."""
+    if not cluster_docs:
+        return {}
+
+    cluster_key = cluster_docs[0]["AWARD_CLUSTER_KEY"]
     
-    load_master_lookups()
+    oracle_num = next((d["ORACLE_AWARD_NUMBER"] for d in cluster_docs if d["ORACLE_AWARD_NUMBER"]), "")
+    cayuse_proj = next((d["CAYUSE_PROJECT_NUMBER"] for d in cluster_docs if d["CAYUSE_PROJECT_NUMBER"]), "")
 
-    pdf_files = list(PDF_SOURCE_DIR.glob("*.pdf"))
-    print(f"📁 Found {len(pdf_files)} PDF documents to process.")
-
-    records = []
-    for idx, pdf in enumerate(pdf_files, 1):
-        try:
-            rec = process_pdf_pass_1(pdf)
-            records.append(rec)
-        except Exception as e:
-            print(f"⚠️ Error processing {pdf.name}: {e}")
-
-        if idx % 1000 == 0 or idx == len(pdf_files):
-            print(f"  -> Processed {idx}/{len(pdf_files)} files...")
-
-    df = pd.DataFrame(records)
-
-    # PASS 2: Lifecycle & Chronology Aggregation
-    print("\n🔄 Running Pass 2: Aggregating Portfolio Lifecycles & Chronology...")
-
-    valid_clusters = df[df['AWARD_CLUSTER_KEY'] != 'UNMATCHED']
-
-    agg_dates = valid_clusters.groupby('AWARD_CLUSTER_KEY').agg(
-        AWARD_CUMULATIVE_START=('DOC_START_DATE', lambda s: min([d for d in s if d] or [''])),
-        AWARD_ULTIMATE_END=('DOC_END_DATE', lambda s: max([d for d in s if d] or ['']))
-    ).reset_index()
-
-    df = df.merge(agg_dates, on='AWARD_CLUSTER_KEY', how='left')
-    df['AWARD_CUMULATIVE_START'] = df['AWARD_CUMULATIVE_START'].fillna('')
-    df['AWARD_ULTIMATE_END']     = df['AWARD_ULTIMATE_END'].fillna('')
-
-    df['DOC_SORT_KEY'] = df['DOC_START_DATE'].replace('', '9999-99-99')
-    df = df.sort_values(by=['AWARD_CLUSTER_KEY', 'DOC_SORT_KEY', 'Original_Filename'])
-    
-    df['CLUSTER_TOTAL_DOCS'] = df.groupby('AWARD_CLUSTER_KEY')['Original_Filename'].transform('count')
-    df['CLUSTER_DOC_RANK']   = df.groupby('AWARD_CLUSTER_KEY').cumcount() + 1
-    
-    df['CHRONO_SEQUENCE'] = df.apply(
-        lambda r: f"Doc {r['CLUSTER_DOC_RANK']} of {r['CLUSTER_TOTAL_DOCS']}" 
-        if r['AWARD_CLUSTER_KEY'] != 'UNMATCHED' else "N/A", 
-        axis=1
+    baseline = (
+        system_baselines.get(oracle_num) or 
+        system_baselines.get(cayuse_proj) or 
+        system_baselines.get(cluster_key, {})
     )
 
-    df.drop(columns=['AWARD_CLUSTER_KEY', 'DOC_SORT_KEY', 'CLUSTER_TOTAL_DOCS', 'CLUSTER_DOC_RANK'], inplace=True)
+    if not oracle_num:
+        oracle_num = baseline.get("ORACLE_AWARD_NUMBER", "")
+    if not cayuse_proj:
+        cayuse_proj = baseline.get("CAYUSE_PROJECT_NUMBER", "")
 
-    canonical_columns = [
-        "PDF_Path", "Markdown_Path", "Original_Filename", "Markdown_Filename",
-        "CAYUSE_PROJECT_NUMBER", "CAYUSE_PROPOSAL_NUMBER", "ORACLE_AWARD_NUMBER",
-        "BANNER_AWARD_UID", "LEAD_PI", "ALN_NUMBER", "ALN_PROGRAM_TITLE",
-        "ALN_SOURCE", "DOCUMENT_ACTION_TAG", "DOC_START_DATE", "DOC_END_DATE",
-        "AWARD_CUMULATIVE_START", "AWARD_ULTIMATE_END", "CHRONO_SEQUENCE",
-        "HAS_BUDGET_TABLE", "BUDGET_PAGES", "Match_Confidence", "Match_Reason"
-    ]
-    df = df[canonical_columns]
+    cayuse_ob = baseline.get("CAYUSE_OBLIGATED", 0.0)
+    oracle_ob = baseline.get("ORACLE_OBLIGATED", 0.0)
+    cayuse_ceiling = baseline.get("CAYUSE_TOTAL_AMOUNT", 0.0)
+    oracle_ceiling = baseline.get("ORACLE_HEADER_HARD_LIMIT", 0.0)
 
-    df.to_excel(OUTPUT_EXCEL_PATH, index=False)
+    c_0 = max(cayuse_ceiling, oracle_ceiling)
+    active_ceiling = c_0
+
+    sorted_docs = sorted(
+        cluster_docs, 
+        key=lambda x: (x["EXECUTION_DATE"] or x["DOC_START_DATE"] or datetime.min)
+    )
+
+    start_dates = [d["DOC_START_DATE"] for d in sorted_docs if d["DOC_START_DATE"]]
+    end_dates = [d["DOC_END_DATE"] for d in sorted_docs if d["DOC_END_DATE"]]
     
-    conn = sqlite3.connect(OUTPUT_SQLITE_PATH)
-    df.to_sql("tbl_Documents", conn, if_exists="replace", index=False)
+    award_start_date_truth = min(start_dates) if start_dates else None
+    award_end_date_truth = max(end_dates) if end_dates else None
+    
+    cum_obligated = 0.0
+    highest_doc_ceiling = 0.0
+    
+    for doc in sorted_docs:
+        cum_obligated += doc["DELTA_OBLIGATED"]
+        if doc["DOC_CEILING"] > 0:
+            active_ceiling = doc["DOC_CEILING"]
+            highest_doc_ceiling = max(highest_doc_ceiling, doc["DOC_CEILING"])
+
+    if active_ceiling == 0.0:
+        active_ceiling = c_0
+
+    ceiling_breach = False
+    audit_status = "IN_SYNC"
+    
+    if cum_obligated > active_ceiling and active_ceiling > 0:
+        if highest_doc_ceiling >= cum_obligated:
+            active_ceiling = highest_doc_ceiling
+            audit_status = "CEILING_RESOLVED_BY_CLUSTER_DOC"
+        else:
+            ceiling_breach = True
+            audit_status = "CEILING_BREACH_UNAPPROVED"
+
+    # Evaluate Verdict and Discrepancy Reason
+    cay_sync = (abs(cum_obligated - cayuse_ob) < 1.0)
+    orc_sync = (abs(cum_obligated - oracle_ob) < 1.0)
+    
+    if ceiling_breach:
+        reconciliation_verdict = "FLAG_CEILING_BREACH"
+        discrepancy_reason = f"Cumulative PDF obligations (${cum_obligated:,.2f}) exceed active ceiling (${active_ceiling:,.2f})."
+    elif cay_sync and orc_sync:
+        reconciliation_verdict = "IN_SYNC"
+        discrepancy_reason = "PDF Truth, Cayuse, and Oracle amounts are fully aligned."
+    elif not cay_sync and orc_sync:
+        reconciliation_verdict = "CAYUSE_UPDATE_REQ"
+        discrepancy_reason = f"PDF Truth (${cum_obligated:,.2f}) matches Oracle, but Cayuse (${cayuse_ob:,.2f}) requires update."
+    elif cay_sync and not orc_sync:
+        reconciliation_verdict = "ORACLE_UPDATE_REQ"
+        discrepancy_reason = f"PDF Truth (${cum_obligated:,.2f}) matches Cayuse, but Oracle (${oracle_ob:,.2f}) requires update."
+    else:
+        reconciliation_verdict = "BOTH_OUT_OF_SYNC"
+        if cayuse_ob == 0.0 and oracle_ob == 0.0 and cum_obligated > 0:
+            discrepancy_reason = f"UNMATCHED_BASELINE: Extracted PDF funds (${cum_obligated:,.2f}), but no Cayuse/Oracle baseline record was matched."
+        elif cum_obligated == 0.0 and (cayuse_ob > 0 or oracle_ob > 0):
+            discrepancy_reason = f"ZERO_PDF_EXTRACTION: System baseline has obligations (Cayuse: ${cayuse_ob:,.2f}, Oracle: ${oracle_ob:,.2f}), but $0 action delta extracted from PDFs."
+        else:
+            discrepancy_reason = f"FINANCIAL_DISCREPANCY: PDF Truth (${cum_obligated:,.2f}) differs from Cayuse (${cayuse_ob:,.2f}) and Oracle (${oracle_ob:,.2f})."
+
+    return {
+        "AWARD_CLUSTER_KEY": cluster_key,
+        "ORACLE_AWARD_NUMBER": oracle_num,
+        "CAYUSE_PROJECT_NUMBER": cayuse_proj,
+        "DOCUMENT_COUNT": len(sorted_docs),
+        "PDF_START_DATE_TRUTH": award_start_date_truth.strftime("%Y-%m-%d") if award_start_date_truth else None,
+        "PDF_END_DATE_TRUTH": award_end_date_truth.strftime("%Y-%m-%d") if award_end_date_truth else None,
+        "PDF_CUMULATIVE_OBLIGATED": cum_obligated,
+        "PDF_ACTIVE_CEILING": active_ceiling,
+        "CAYUSE_OBLIGATED": cayuse_ob,
+        "ORACLE_OBLIGATED": oracle_ob,
+        "CAYUSE_CEILING": cayuse_ceiling,
+        "ORACLE_CEILING": oracle_ceiling,
+        "CEILING_BREACH": ceiling_breach,
+        "AUDIT_STATUS": audit_status,
+        "RECONCILIATION_VERDICT": reconciliation_verdict,
+        "DISCREPANCY_REASON": discrepancy_reason
+    }
+
+# ==========================================
+# DATABASE INITIALIZATION
+# ==========================================
+def initialize_database(db_path: Path):
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tbl_Documents (
+        PDF_Path TEXT PRIMARY KEY,
+        Markdown_Path TEXT,
+        Filename TEXT,
+        AWARD_CLUSTER_KEY TEXT,
+        ORACLE_AWARD_NUMBER TEXT,
+        CAYUSE_PROJECT_NUMBER TEXT,
+        EXECUTION_DATE TEXT,
+        DOC_START_DATE TEXT,
+        DOC_END_DATE TEXT,
+        DELTA_OBLIGATED REAL,
+        DOC_CEILING REAL,
+        HAS_BUDGET_TABLE INTEGER,
+        TABLE_TOTAL REAL,
+        TABLE_DIRECT REAL,
+        TABLE_INDIRECT REAL,
+        BUDGET_SPLIT_STATUS TEXT
+    )
+    """)
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tbl_Reconciliation_Summary (
+        AWARD_CLUSTER_KEY TEXT PRIMARY KEY,
+        ORACLE_AWARD_NUMBER TEXT,
+        CAYUSE_PROJECT_NUMBER TEXT,
+        DOCUMENT_COUNT INTEGER,
+        PDF_START_DATE_TRUTH TEXT,
+        PDF_END_DATE_TRUTH TEXT,
+        PDF_CUMULATIVE_OBLIGATED REAL,
+        PDF_ACTIVE_CEILING REAL,
+        CAYUSE_OBLIGATED REAL,
+        ORACLE_OBLIGATED REAL,
+        CAYUSE_CEILING REAL,
+        ORACLE_CEILING REAL,
+        CEILING_BREACH INTEGER,
+        AUDIT_STATUS TEXT,
+        RECONCILIATION_VERDICT TEXT,
+        DISCREPANCY_REASON TEXT,
+        REVIEW_STATUS TEXT DEFAULT 'PENDING',
+        REVIEWER_NOTES TEXT
+    )
+    """)
+    
+    conn.commit()
     conn.close()
 
-    print("\n=================== PIPELINE EXECUTION SUMMARY ===================")
-    print(f"Total Files Processed   : {len(df)}")
-    print("Match Confidence Breakdown:")
-    print(df['Match_Confidence'].value_counts().to_string())
-    print("------------------------------------------------------------------")
-    print(f"Budget Tables Tagged    : {df['HAS_BUDGET_TABLE'].sum()} documents")
-    print(f"Output Audit Excel      : {OUTPUT_EXCEL_PATH}")
-    print(f"Output Portfolio SQLite : {OUTPUT_SQLITE_PATH}")
-    print("==================================================================")
+# ==========================================
+# MAIN EXECUTION PIPELINE
+# ==========================================
+def main():
+    print("=== STARTING PRODUCTION 3-WAY RECONCILIATION PIPELINE ===")
+    initialize_database(OUTPUT_SQLITE_PATH)
+    
+    # 1. Load Real System Baselines from Excel
+    system_baselines = load_system_baselines(TRIAGE_EXCEL_PATH)
+    
+    # 2. Discover and Process Actual Document Corpus
+    if not PDF_SOURCE_DIR.exists():
+        print(f"Error: PDF source directory '{PDF_SOURCE_DIR}' does not exist.")
+        return
+
+    pdf_files = list(PDF_SOURCE_DIR.glob("*.pdf"))
+    print(f"Found {len(pdf_files)} PDF documents in '{PDF_SOURCE_DIR}'...")
+    
+    extracted_documents = []
+    for idx, pdf_path in enumerate(pdf_files, 1):
+        doc_data = process_document_pass_1(pdf_path, MD_OUTPUT_DIR)
+        extracted_documents.append(doc_data)
+        
+        if idx % 1000 == 0 or idx == len(pdf_files):
+            print(f" -> Processed {idx}/{len(pdf_files)} documents...")
+
+    if not extracted_documents:
+        print("No documents found or extracted. Exiting pipeline.")
+        return
+
+    # 3. Group Extracted Records by Award Cluster Key
+    clusters = {}
+    for doc in extracted_documents:
+        ckey = doc["AWARD_CLUSTER_KEY"]
+        clusters.setdefault(ckey, []).append(doc)
+        
+    # 4. Pass 2 & Pass 3: Portfolio Accumulation & Reconciliation
+    reconciliation_results = []
+    for ckey, doc_list in clusters.items():
+        synth = synthesize_portfolio_pass_2(doc_list, system_baselines)
+        reconciliation_results.append(synth)
+
+    # 5. Export Staging Data to SQLite
+    conn = sqlite3.connect(OUTPUT_SQLITE_PATH)
+    
+    doc_df = pd.DataFrame(extracted_documents)
+    for col in ["EXECUTION_DATE", "DOC_START_DATE", "DOC_END_DATE"]:
+        if col in doc_df.columns:
+            doc_df[col] = doc_df[col].astype(str)
+            
+    doc_df.to_sql("tbl_Documents", conn, if_exists="replace", index=False)
+    
+    recon_df = pd.DataFrame(reconciliation_results)
+    recon_df.to_sql("tbl_Reconciliation_Summary", conn, if_exists="replace", index=False)
+    conn.close()
+
+    # 6. Export Final Audit Report Workbook
+    OUTPUT_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(OUTPUT_EXCEL_PATH, engine='openpyxl') as writer:
+        recon_df.to_excel(writer, sheet_name="3Way_Reconciliation", index=False)
+        doc_df.to_excel(writer, sheet_name="Document_Level_Detail", index=False)
+
+    print(f"\nPipeline Execution Complete!")
+    print(f"-> SQLite Staged Database: {OUTPUT_SQLITE_PATH}")
+    print(f"-> Audit Workbook: {OUTPUT_EXCEL_PATH}")
 
 if __name__ == "__main__":
-    run_pipeline()
+    main()
