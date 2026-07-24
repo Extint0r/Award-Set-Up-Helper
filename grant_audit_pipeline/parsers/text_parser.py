@@ -81,6 +81,40 @@ def extract_header_date_context(text: str, max_chars: int = 5000, window: int = 
     return snippets
 
 
+def parse_dates_from_snippets(snippets: List[Dict[str, str]]) -> Dict[str, Optional[str]]:
+    """
+    Parses start, end, and execution dates from context snippets 
+    with label-anchored regex to prevent label mismatch.
+    """
+    if not snippets:
+        return {'start_date': None, 'end_date': None, 'exec_date': None}
+
+    full_snippet_text = " ".join([s.get("context", "") for s in snippets if isinstance(s, dict)])
+    
+    date_pat = r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}|\d{4}-\d{2}-\d{2})\b'
+    
+    extracted = {'start_date': None, 'end_date': None, 'exec_date': None}
+
+    # 1. Budget Period Range Match (e.g., "Budget Period: 04/01/2025 - 03/31/2026")
+    budget_match = re.search(
+        r'(?:Budget\s*Period|Current\s*Budget)\b.{0,60}?(?P<start>' + date_pat + r').{0,30}?(?:to|through|-|–|End\s*Date)\s*(?P<end>' + date_pat + r')', 
+        full_snippet_text, re.IGNORECASE
+    )
+    if budget_match:
+        extracted['start_date'] = budget_match.group('start')
+        extracted['end_date'] = budget_match.group('end')
+
+    # 2. Execution / Issue Date Match (e.g., "Award Date: 04/18/2023")
+    exec_match = re.search(
+        r'(?:Award\s*Date|Issue\s*Date|Date\s*Issued|Federal\s*Award\s*Date)\b.{0,30}?(?P<exec>' + date_pat + r')', 
+        full_snippet_text, re.IGNORECASE
+    )
+    if exec_match:
+        extracted['exec_date'] = exec_match.group('exec')
+
+    return extracted
+
+
 def parse_osr_matrix_grid(body_text: str) -> Tuple[float, float, float, float]:
     """
     Parses the 4-column AWARDS grid on OSR Award Data Sheets (2014-2018)
@@ -95,12 +129,12 @@ def parse_osr_matrix_grid(body_text: str) -> Tuple[float, float, float, float]:
         indirects = re.findall(r'Indirect\s*Costs:\s*([\d,]+(?:\.\d{2})?)', body_text, re.IGNORECASE)
         
         if totals:
-            total = parse_dollar_amount(totals[0])  # Position 0: Current Action Total
+            total = parse_dollar_amount(totals[0])
             
         if len(totals) >= 4:
-            ceiling = parse_dollar_amount(totals[3])  # Position 3: Total Project Amount
+            ceiling = parse_dollar_amount(totals[3])
         elif len(totals) >= 2 and ceiling == 0.0:
-            ceiling = parse_dollar_amount(totals[1])  # Fallback to Awarded to Date
+            ceiling = parse_dollar_amount(totals[1])
             
         if directs:
             direct = parse_dollar_amount(directs[0])
@@ -122,12 +156,10 @@ def route_era_budget_extraction(
     direct, indirect, total, ceiling = 0.0, 0.0, 0.0, 0.0
     template_tag = "GENERIC_KEY_VALUE"
 
-    # 1. Classic OSR Era (2014 - 2018): 4-Column Award Data Sheet Matrix
     if yy_year is not None and 14 <= yy_year <= 18:
         template_tag = "OSR_Matrix_2014_2018"
         direct, indirect, total, ceiling = parse_osr_matrix_grid(body_text)
 
-    # 2. Mid-Era & Modern Cayuse/Oracle Era (2019+): Web-Form & Header Key-Values
     elif yy_year is not None and yy_year >= 19:
         template_tag = "Cayuse_Oracle_2019_Plus"
         tot_m = re.search(
@@ -137,7 +169,6 @@ def route_era_budget_extraction(
         if tot_m:
             total = parse_dollar_amount(tot_m.group(1))
 
-    # 3. Legacy Era (2013 and older): Legacy Key-Value Patterns
     else:
         template_tag = "Legacy_Pre_2014"
         tot_m = re.search(r'Total\s*Amount\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)', body_text, re.IGNORECASE)
@@ -186,7 +217,6 @@ def process_document_pass_1(
     raw_cay_prop   = cay_prop_matches[0] if cay_prop_matches else ""
     raw_oracle_num = oracle_matches[0] if oracle_matches else ""
 
-    # Extract Cayuse Year (YY)
     cayuse_yy = extract_cayuse_year(raw_cay_proj, filename)
 
     # 2. Text Extraction & Page Inspection
@@ -212,6 +242,9 @@ def process_document_pass_1(
 
     # Contextual date snippet extraction (Runs AFTER body_text is assigned)
     date_snippets = extract_header_date_context(body_text, max_chars=5000, window=200)
+
+    # Contextual Snippet Date Inference Fallback
+    snippet_dates = parse_dates_from_snippets(date_snippets)
 
     if not raw_banner and body_text:
         banner_txt = re.search(r'(?:Rice\s*Fund\s*No\.?|Rfund\s*#?)\s*[:\=]?\s*(R\d{4,6})\b', body_text, re.IGNORECASE)
@@ -239,6 +272,14 @@ def process_document_pass_1(
     doc_start_date = parse_date(range_match.group(1)) if range_match else None
     doc_end_date = parse_date(range_match.group(2)) if range_match else None
 
+    # Apply Contextual Snippet Inferences if header regex was empty
+    if not doc_start_date and snippet_dates['start_date']:
+        doc_start_date = parse_date(snippet_dates['start_date'])
+    if not doc_end_date and snippet_dates['end_date']:
+        doc_end_date = parse_date(snippet_dates['end_date'])
+    if not execution_date and snippet_dates['exec_date']:
+        execution_date = parse_date(snippet_dates['exec_date'])
+
     # Route Era-Specific Budget Extraction on pure body text
     era_dir, era_ind, era_tot, era_ceil, era_template_tag = route_era_budget_extraction(body_text, cayuse_yy)
     
@@ -257,8 +298,13 @@ def process_document_pass_1(
     budget_split_status = "NO_BUDGET_TABLE"
     extraction_method = "PyMuPDF_Fast"
 
+    v_exec_date = None
+    v_budget_start = None
+    v_budget_end = None
+    v_proj_start = None
+    v_proj_end = None
+
     if has_budget_table and not is_nce_action and not is_subcontract_out:
-        # Fallback 1: Text regex
         if table_total == 0.0:
             tot_match = RE_BUDGET_TOTAL.search(body_text)
             ind_match = RE_INDIRECT_COST.search(body_text)
@@ -267,7 +313,6 @@ def process_document_pass_1(
             if ind_match:
                 table_indirect = parse_dollar_amount(ind_match.group(1))
 
-        # Fallback 2: PyMuPDF table structure
         if table_total == 0.0:
             tb_direct, tb_indirect, tb_total = extract_budget_from_pdf_tables(pdf_path)
             if tb_total > 0:
@@ -275,11 +320,11 @@ def process_document_pass_1(
                 table_indirect = tb_indirect
                 table_total = tb_total
 
-        # Vision AI Evaluation (Triggered as Primary Handoff or Verification)
         if ENABLE_VISION_FALLBACK and budget_pages:
-            v_res = parse_budget_table_with_vision(pdf_path, budget_pages[0])
+            # Guarantee Page 1 (NoA Cover Page with Boxes 19/20/26/27) is inspected
+            target_vision_page = 1 if (1 in budget_pages or not budget_pages) else budget_pages[0]
+            v_res = parse_budget_table_with_vision(pdf_path, target_vision_page)
             if v_res.get("VISION_EVAL_STATUS") == "PASSED" and v_res.get("VISION_PARSED_TOTAL", 0.0) > 0:
-                # If PyMuPDF missed the total OR Vision provided a higher-confidence budget
                 if table_total == 0.0 or v_res.get("VISION_CONFIDENCE_SCORE", 0.0) >= 0.8:
                     table_direct = v_res["VISION_PARSED_DIRECT"]
                     table_indirect = v_res["VISION_PARSED_INDIRECT"]
@@ -292,7 +337,6 @@ def process_document_pass_1(
                     if v_res["VISION_PARSED_CEILING"] > 0 and doc_ceiling == 0.0:
                         doc_ceiling = v_res["VISION_PARSED_CEILING"]
                     extraction_method = "Multimodal_Vision_AI"
-                    
 
         if table_total > 0:
             if table_direct == 0.0:
@@ -376,5 +420,10 @@ def process_document_pass_1(
         "ALN_NUMBER": aln_number,
         "TEXT_BODY": body_text,
         "BUDGET_PAGES": budget_pages,
-        "DATE_SNIPPETS": date_snippets
+        "DATE_SNIPPETS": date_snippets,
+        "VISION_EXECUTION_DATE": v_exec_date,
+        "VISION_BUDGET_START": v_budget_start,
+        "VISION_BUDGET_END": v_budget_end,
+        "VISION_PROJECT_START": v_proj_start,
+        "VISION_PROJECT_END": v_proj_end
     }

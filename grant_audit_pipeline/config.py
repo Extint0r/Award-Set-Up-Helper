@@ -12,8 +12,11 @@ load_dotenv()
 # ==========================================
 # PATH & ENVIRONMENT CONFIGURATION
 # ==========================================
-TRIAGE_EXCEL_PATH  = Path(r"2026_7_20_CAYUSE_ORACLE_TRIAGE.xlsx")
-ALN_CSV_PATH       = Path(r"ALN.csv")
+BASE_DIR = Path(__file__).parent
+
+# Absolute anchor guarantees it finds the file in the script's root directory
+TRIAGE_EXCEL_PATH  = BASE_DIR / "2026_7_20_CAYUSE_ORACLE_TRIAGE.xlsx" # (or 2027_7_20 if named 2027)
+ALN_CSV_PATH       = BASE_DIR / "ALN.csv"
 
 OSP_SOURCE_DIR     = Path(r"D:\0-Batch-AWARDS\processed_files")
 ORACLE_PARENT_DIR  = Path(r"D:\OSR pdf notices")

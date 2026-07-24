@@ -12,7 +12,6 @@ def sanitize_complex_types_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     """
     df_clean = df.copy()
     for col in df_clean.columns:
-        # Check if any element in the column is a list, dict, or complex object
         if df_clean[col].apply(lambda x: isinstance(x, (list, dict))).any():
             df_clean[col] = df_clean[col].apply(
                 lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else ("" if pd.isna(x) else str(x))
@@ -23,10 +22,10 @@ def export_audit_workbook(recon_df: pd.DataFrame, doc_df: pd.DataFrame, excel_pa
     """Exports audit results with Excel Tables, Clickable Hyperlinks, Short Dates, and JSON String Sanitization."""
     excel_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # 1. Format and parse datetime columns
+    # 1. Format and parse datetime columns cleanly with format='mixed' to eliminate UserWarnings
     for col in ["PDF_START_DATE_TRUTH", "PDF_END_DATE_TRUTH"]:
         if col in recon_df.columns:
-            recon_df[col] = pd.to_datetime(recon_df[col], errors='coerce')
+            recon_df[col] = pd.to_datetime(recon_df[col], format='mixed', errors='coerce')
             
     date_cols_doc = [
         "EXECUTION_DATE", "DOC_START_DATE", "DOC_END_DATE", 
@@ -35,7 +34,7 @@ def export_audit_workbook(recon_df: pd.DataFrame, doc_df: pd.DataFrame, excel_pa
     ]
     for col in date_cols_doc:
         if col in doc_df.columns:
-            doc_df[col] = pd.to_datetime(doc_df[col], errors='coerce')
+            doc_df[col] = pd.to_datetime(doc_df[col], format='mixed', errors='coerce')
 
     # 2. Drop heavy unneeded body/raw columns for Excel export
     cols_to_drop = ["FILE_HASH", "SOURCE_TAG", "RAW_CAYUSE_PROJ", "RAW_CAYUSE_PROP", "RAW_ORACLE_NUM", "RAW_BANNER_UID", "TEXT_BODY"]
@@ -79,11 +78,9 @@ def export_audit_workbook(recon_df: pd.DataFrame, doc_df: pd.DataFrame, excel_pa
             cell = ws_docs.cell(row=row, column=col_idx)
             val_str = str(cell.value) if cell.value else ""
             
-            # Short Date Format for any date-related column
             if ("DATE" in str(h) or "START" in str(h) or "END" in str(h)) and cell.value:
                 cell.number_format = 'm/d/yyyy'
 
-            # Format Clickable Hyperlinks
             if str(h) in path_cols and val_str and val_str not in ("N/A", "nan", "None", ""):
                 file_uri = "file:///" + val_str.replace("\\", "/")
                 cell.hyperlink = file_uri
