@@ -1,0 +1,22 @@
+# Secrets and API Keys
+.env
+credentials.json
+authorized_user.json
+
+# Local Pipeline Databases and Logs
+pipeline_tracker.db
+admin_error_log.csv
+debug_raw_response.txt
+
+# Python Environment Leftovers
+__pycache__/
+*.pyc
+
+# Local Test Vaults
+legacy_pdf_vault/
+
+# Local Pipeline Databases and Logs
+*.db
+*.csv
+*.txt
+*.xlsx

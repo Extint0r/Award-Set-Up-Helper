@@ -34,20 +34,22 @@ OUTPUT_SQLITE_PATH = REVIEW_DIR / "AUDIT_INDEX_TABLE.db"
 # ==========================================
 # REGEX PATTERNS & MATCHING ENGINES
 # ==========================================
+# Digit lookarounds (?<!\d) replace \b to capture IDs bounded by underscores (_131004_)
+RE_ORACLE_NUM  = re.compile(r'(?<!\d)([1-9]\d{5})(?!\d)')
 RE_CAYUSE_PROJ = re.compile(r'(?<![A-Za-z0-9])(\d{2}-\d{4})(?![A-Za-z0-9])')
 RE_CAYUSE_PROP = re.compile(r'(?<![A-Za-z0-9])(A\d{2}-\d{4})(?![A-Za-z0-9])', re.IGNORECASE)
-RE_ORACLE_NUM  = re.compile(r'\b([1-9]\d{5})\b')
 RE_BANNER_UID  = re.compile(r'(?<![A-Za-z0-9])(R\d{4,6})(?![A-Za-z0-9])', re.IGNORECASE)
 RE_ALN         = re.compile(r'(?<!\d)(\d{2}\.\d{3})(?!\d)')
 
 RE_EXECUTION_DATE = re.compile(
-    r'(?:Date|Execution\s*Date|Notice\s*Date|Award\s*Date)\s*[:\=]?\s*(\d{1,2}/\d{1,2}/\d{2,4})',
+    r'(?:Date|Execution\s*Date|Notice\s*Date|Award\s*Date)\s*[:\=]?\s*(\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]+\s+\d{1,2},\s*\d{4}|\d{1,2}-[A-Za-z]+-\d{2,4})',
     re.IGNORECASE
 )
 
 RE_DATE_RANGE = re.compile(
     r'(?:Project\s*Period|Award\s*Period|Performance\s*Period|Grant\s*Period)\s*[:\=]?\s*'
-    r'(\d{1,2}/\d{1,2}/\d{2,4})\s*[-–—\s+to\s+]+\s*(\d{1,2}/\d{1,2}/\d{2,4})',
+    r'(\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]+\s+\d{1,2},\s*\d{4}|\d{1,2}-[A-Za-z]+-\d{2,4})\s*[-–—\s+to\s+]+\s*'
+    r'(\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]+\s+\d{1,2},\s*\d{4}|\d{1,2}-[A-Za-z]+-\d{2,4})',
     re.IGNORECASE
 )
 
@@ -90,7 +92,6 @@ def parse_dollar_amount(val_str: Any) -> float:
         return 0.0
     s = str(val_str).strip().lower()
     
-    # Shorthand matching (e.g., $500k, $1.8m)
     m_shorthand = re.search(r'\$?\s*([\d,]+(?:\.\d+)?)\s*(k|m|million|thousand|b|billion)\b', s, re.IGNORECASE)
     if m_shorthand:
         num = float(m_shorthand.group(1).replace(',', ''))
@@ -109,15 +110,51 @@ def parse_dollar_amount(val_str: Any) -> float:
         return 0.0
 
 def parse_date(date_str: Any) -> Optional[datetime]:
-    """Parses date string into standard datetime object."""
+    """Expanded date parser supporting text dates (e.g., August 31, 2021) and numeric formats."""
     if pd.isna(date_str) or not date_str:
         return None
-    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+    s = str(date_str).strip()
+    
+    formats = (
+        "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d",
+        "%B %d, %Y", "%b %d, %Y", "%d-%b-%Y", "%d %b %Y", "%d %B %Y"
+    )
+    for fmt in formats:
         try:
-            return datetime.strptime(str(date_str).strip(), fmt)
+            return datetime.strptime(s, fmt)
         except ValueError:
             pass
     return None
+
+def extract_budget_from_pdf_tables(pdf_path: Path) -> Tuple[float, float, float]:
+    """Fallback: Extracts structured tabular budget data directly from PDF if Markdown flattened headers."""
+    direct, indirect, total = 0.0, 0.0, 0.0
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            tabs = page.find_tables()
+            for tab in tabs:
+                df = tab.to_pandas()
+                df.columns = [str(c).lower().strip() for c in df.columns]
+                
+                for _, row in df.iterrows():
+                    row_str = " ".join([str(v).lower() for v in row.values])
+                    
+                    if any(kw in row_str for kw in ["total", "cumulative", "budget", "action"]):
+                        nums = [parse_dollar_amount(v) for v in row.values if parse_dollar_amount(v) > 0]
+                        if len(nums) >= 3:
+                            direct = max(direct, nums[0])
+                            indirect = max(indirect, nums[1])
+                            total = max(total, nums[2])
+                        elif len(nums) == 2:
+                            direct = max(direct, nums[0])
+                            total = max(total, nums[1])
+                        elif len(nums) == 1 and total == 0.0:
+                            total = nums[0]
+        doc.close()
+    except Exception:
+        pass
+    return direct, indirect, total
 
 def compute_file_hash(pdf_path: Path) -> str:
     """Computes MD5 hash for exact binary duplicate matching."""
@@ -134,13 +171,11 @@ def discover_pdf_files() -> List[Tuple[Path, str]]:
     """Discovers PDFs across OSP folder and non-empty Oracle FY subfolders."""
     discovered = []
     
-    # 1. Sweep Primary OSP Directory
     if OSP_SOURCE_DIR.exists():
         for p in OSP_SOURCE_DIR.glob("*.pdf"):
             if p.is_file():
                 discovered.append((p, "OSP"))
 
-    # 2. Sweep Oracle Subfolders (FY 2018 - FY 2026)
     if ORACLE_PARENT_DIR.exists():
         fy_subdirs = [p for p in ORACLE_PARENT_DIR.glob("FY 20*") if p.is_dir()]
         for fy_dir in sorted(fy_subdirs):
@@ -209,7 +244,7 @@ def load_system_baselines(triage_excel_path: Path) -> Dict[str, Dict[str, Any]]:
             cayuse_prop = str(row.get("CAYUSE_PROPOSAL_NUMBER", "")).strip()
 
             if oracle_num and oracle_num not in ('nan', 'None', ''):
-                if cayuse_proj and cayuse_proj not in ('nan', 'None', ''):
+                if cayuse_proj and cayuse_proj not in ('nan', 'None', '') and not cayuse_proj.startswith('A'):
                     LOOKUP_PROJ_TO_ORACLE[cayuse_proj] = oracle_num
                     LOOKUP_ORACLE_TO_PROJ[oracle_num] = cayuse_proj
                 if cayuse_prop and cayuse_prop not in ('nan', 'None', ''):
@@ -234,6 +269,55 @@ def load_system_baselines(triage_excel_path: Path) -> Dict[str, Dict[str, Any]]:
         print(f"Error loading baseline file '{triage_excel_path}': {e}")
         return {}
 
+def build_dynamic_crosswalk(extracted_docs: List[Dict[str, Any]]):
+    """Scans raw filename extractions across the entire batch to unify split cluster keys."""
+    global LOOKUP_PROJ_TO_ORACLE, LOOKUP_ORACLE_TO_PROJ, LOOKUP_PROP_TO_ORACLE
+    
+    # 1. First Pass: Build bidirectional mappings strictly from RAW extracted values
+    for doc in extracted_docs:
+        r_proj = doc.get("RAW_CAYUSE_PROJ", "")
+        r_prop = doc.get("RAW_CAYUSE_PROP", "")
+        r_oracle = doc.get("RAW_ORACLE_NUM", "")
+        
+        if r_oracle:
+            if r_proj:
+                LOOKUP_PROJ_TO_ORACLE[r_proj] = r_oracle
+                LOOKUP_ORACLE_TO_PROJ[r_oracle] = r_proj
+            if r_prop:
+                LOOKUP_PROP_TO_ORACLE[r_prop] = r_oracle
+
+    # 2. Second Pass: Uniformly re-resolve identifiers and cluster keys across all records
+    for doc in extracted_docs:
+        r_proj = doc.get("RAW_CAYUSE_PROJ", "")
+        r_prop = doc.get("RAW_CAYUSE_PROP", "")
+        r_oracle = doc.get("RAW_ORACLE_NUM", "")
+        
+        resolved_oracle = (
+            r_oracle or 
+            LOOKUP_PROJ_TO_ORACLE.get(r_proj, "") or 
+            LOOKUP_PROP_TO_ORACLE.get(r_prop, "")
+        )
+        
+        resolved_cayuse_proj = (
+            r_proj or 
+            LOOKUP_ORACLE_TO_PROJ.get(resolved_oracle, "")
+        )
+        
+        doc["ORACLE_AWARD_NUMBER"] = resolved_oracle
+        doc["CAYUSE_PROJECT_NUMBER"] = resolved_cayuse_proj
+        doc["CAYUSE_PROPOSAL_NUMBER"] = r_prop
+        doc["AWARD_CLUSTER_KEY"] = resolved_oracle or resolved_cayuse_proj or "UNKNOWN"
+
+        if resolved_oracle:
+            doc["MATCH_CONFIDENCE"] = "Active Index Match"
+            doc["MATCH_REASON"] = f"Matched Oracle Award Number ({resolved_oracle})"
+        elif resolved_cayuse_proj:
+            doc["MATCH_CONFIDENCE"] = "Cayuse Inference"
+            doc["MATCH_REASON"] = f"Matched Cayuse Project Number ({resolved_cayuse_proj})"
+        else:
+            doc["MATCH_CONFIDENCE"] = "Unmatched Baseline"
+            doc["MATCH_REASON"] = "No direct Oracle or Cayuse ID in filename"
+
 # ==========================================
 # PASS 1: PER-DOCUMENT EXTRACTION
 # ==========================================
@@ -257,33 +341,23 @@ def process_document_pass_1(pdf_path: Path, source_tag: str, md_dir: Path, aln_d
     pi_match = re.match(r'^([A-Za-z]+_[A-Za-z]+)', filename)
     lead_pi  = pi_match.group(1) if pi_match else "EXTRACTED_PI"
 
-    cay_proj   = cay_proj_matches[0] if cay_proj_matches else ""
-    cay_prop   = cay_prop_matches[0] if cay_prop_matches else ""
-    oracle_num = oracle_matches[0] if oracle_matches else ""
+    raw_cay_proj   = cay_proj_matches[0] if cay_proj_matches else ""
+    raw_cay_prop   = cay_prop_matches[0] if cay_prop_matches else ""
+    raw_oracle_num = oracle_matches[0] if oracle_matches else ""
 
+    # Initial Pass 1 Resolution
     resolved_oracle = (
-        oracle_num or 
-        LOOKUP_PROJ_TO_ORACLE.get(cay_proj, "") or 
-        LOOKUP_PROP_TO_ORACLE.get(cay_prop, "")
+        raw_oracle_num or 
+        LOOKUP_PROJ_TO_ORACLE.get(raw_cay_proj, "") or 
+        LOOKUP_PROP_TO_ORACLE.get(raw_cay_prop, "")
     )
     
     resolved_cayuse = (
-        cay_proj or 
-        LOOKUP_ORACLE_TO_PROJ.get(oracle_num, "") or 
-        cay_prop
+        raw_cay_proj or 
+        LOOKUP_ORACLE_TO_PROJ.get(raw_oracle_num, "")
     )
 
     cluster_key = resolved_oracle or resolved_cayuse or "UNKNOWN"
-
-    if oracle_num:
-        match_confidence = "Active Index Match"
-        match_reason = f"Matched Oracle Award Number ({oracle_num})"
-    elif cay_proj:
-        match_confidence = "Cayuse Inference"
-        match_reason = f"Matched Cayuse Project Number ({cay_proj})"
-    else:
-        match_confidence = "Unmatched Baseline"
-        match_reason = "No direct Oracle or Cayuse ID in filename"
 
     # 2. Text Extraction & Page Inspection
     budget_pages: List[int] = []
@@ -356,7 +430,7 @@ def process_document_pass_1(pdf_path: Path, source_tag: str, md_dir: Path, aln_d
                 doc_ceiling = parse_dollar_amount(cum_match.group(3))
 
             vertical_action_matches = re.findall(
-                r'(\d{2}/\d{2}/\d{4})\s*[\r\n]+\s*(\d{2}/\d{2}/\d{4})\s*[\r\n]+\s*(\d{2}/\d{2}/\d{4})\s*[\r\n]+\s*(\d{1,2}(?:\.\d+)?%)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)',
+                r'(\d{2}/\d{2}/\d{4}|[A-Za-z]+\s+\d{1,2},\s*\d{4})\s*[\r\n]+\s*(\d{2}/\d{2}/\d{4}|[A-Za-z]+\s+\d{1,2},\s*\d{4})\s*[\r\n]+\s*(\d{2}/\d{2}/\d{4}|[A-Za-z]+\s+\d{1,2},\s*\d{4})\s*[\r\n]+\s*(\d{1,2}(?:\.\d+)?%)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)\s*[\r\n]+\s*\$([\d,]+(?:\.\d{2})?)',
                 text
             )
             if vertical_action_matches:
@@ -371,12 +445,19 @@ def process_document_pass_1(pdf_path: Path, source_tag: str, md_dir: Path, aln_d
                 table_indirect = parse_dollar_amount(fa_str)
                 table_total = parse_dollar_amount(tot_str)
 
-        # Smart Fallback Engine: Override delta_obligated if budget table is present & valid
+        # PyMuPDF Table Finder Fallback
+        if table_total == 0.0:
+            tb_direct, tb_indirect, tb_total = extract_budget_from_pdf_tables(pdf_path)
+            if tb_total > 0:
+                table_direct = tb_direct
+                table_indirect = tb_indirect
+                table_total = tb_total
+
+        # Smart Fallback Engine
         if table_total > 0:
             if table_direct == 0.0:
                 table_direct = max(0.0, table_total - table_indirect)
             
-            # Fallback if header obligation was zero or a minor truncated number
             if delta_obligated == 0.0 or (delta_obligated < 1000 and table_total >= 10000) or (delta_obligated / table_total < 0.01):
                 delta_obligated = table_total
                 budget_split_status = "FALLBACK_TABLE_TOTAL"
@@ -398,11 +479,9 @@ def process_document_pass_1(pdf_path: Path, source_tag: str, md_dir: Path, aln_d
         "award_cluster_key": cluster_key,
         "oracle_award_number": resolved_oracle,
         "cayuse_project_number": resolved_cayuse,
-        "cayuse_proposal_number": cay_prop,
+        "cayuse_proposal_number": raw_cay_prop,
         "banner_award_uid": banner_uid,
         "lead_pi": lead_pi,
-        "match_confidence": match_confidence,
-        "match_reason": match_reason,
         "action_tag": action_tag,
         "aln_number": aln_number,
         "aln_program_title": aln_title,
@@ -436,9 +515,13 @@ def process_document_pass_1(pdf_path: Path, source_tag: str, md_dir: Path, aln_d
         "Filename": filename,
         "FILE_HASH": file_hash,
         "SOURCE_TAG": source_tag,
+        "RAW_CAYUSE_PROJ": raw_cay_proj,
+        "RAW_CAYUSE_PROP": raw_cay_prop,
+        "RAW_ORACLE_NUM": raw_oracle_num,
         "AWARD_CLUSTER_KEY": cluster_key,
         "ORACLE_AWARD_NUMBER": resolved_oracle,
         "CAYUSE_PROJECT_NUMBER": resolved_cayuse,
+        "CAYUSE_PROPOSAL_NUMBER": raw_cay_prop,
         "BANNER_AWARD_UID": banner_uid,
         "EXECUTION_DATE": execution_date,
         "DOC_START_DATE": doc_start_date,
@@ -459,7 +542,6 @@ def deduplicate_and_merge_sources(extracted_docs: List[Dict[str, Any]]) -> List[
     """Merges OSP and Oracle Post-Award document instances, assigning ORIGIN_STATUS and CROSS_REF_PATH."""
     merged_docs: List[Dict[str, Any]] = []
     
-    # Tier 1: Group by Exact MD5 Binary Hash
     hash_groups: Dict[str, List[Dict[str, Any]]] = {}
     unhashed_docs = []
     
@@ -480,7 +562,6 @@ def deduplicate_and_merge_sources(extracted_docs: List[Dict[str, Any]]) -> List[
         
         if len(sources) > 1 or len(group) > 1:
             primary_doc["ORIGIN_STATUS"] = "PRESENT_IN_BOTH" if len(sources) > 1 else f"{list(sources)[0]}_DUPLICATE"
-            # Cross reference path is the secondary file path
             secondary_doc = next((d for d in group if d["PDF_Path"] != primary_doc["PDF_Path"]), None)
             primary_doc["CROSS_REF_PATH"] = secondary_doc["PDF_Path"] if secondary_doc else "N/A"
         else:
@@ -489,10 +570,7 @@ def deduplicate_and_merge_sources(extracted_docs: List[Dict[str, Any]]) -> List[
             
         merged_docs.append(primary_doc)
 
-    # Tier 2: Metadata Fingerprint Alignment for remaining files
-    # Fingerprint: (AWARD_CLUSTER_KEY, round(DELTA_OBLIGATED, 2), EXECUTION_DATE, DOC_START_DATE)
     fingerprints: Dict[Tuple, List[Dict[str, Any]]] = {}
-    remaining_docs = unhashed_docs
     
     final_docs = []
     for doc in merged_docs:
@@ -503,7 +581,6 @@ def deduplicate_and_merge_sources(extracted_docs: List[Dict[str, Any]]) -> List[
                 doc["EXECUTION_DATE"], 
                 doc["DOC_START_DATE"]
             )
-            # Only match if non-trivial
             if doc["AWARD_CLUSTER_KEY"] != "UNKNOWN" and doc["DELTA_OBLIGATED"] > 0:
                 fingerprints.setdefault(fp, []).append(doc)
             else:
@@ -651,6 +728,9 @@ def initialize_database(db_path: Path):
         AWARD_CLUSTER_KEY TEXT,
         ORACLE_AWARD_NUMBER TEXT,
         CAYUSE_PROJECT_NUMBER TEXT,
+        CAYUSE_PROPOSAL_NUMBER TEXT,
+        MATCH_CONFIDENCE TEXT,
+        MATCH_REASON TEXT,
         BANNER_AWARD_UID TEXT,
         EXECUTION_DATE TEXT,
         DOC_START_DATE TEXT,
@@ -698,7 +778,6 @@ def export_audit_workbook(recon_df: pd.DataFrame, doc_df: pd.DataFrame, excel_pa
     """Exports audit results with Excel Tables, Clickable Hyperlinks, and Short Dates."""
     excel_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Pre-process dates to standard pandas Timestamps
     for col in ["PDF_START_DATE_TRUTH", "PDF_END_DATE_TRUTH"]:
         if col in recon_df.columns:
             recon_df[col] = pd.to_datetime(recon_df[col], errors='coerce')
@@ -707,9 +786,13 @@ def export_audit_workbook(recon_df: pd.DataFrame, doc_df: pd.DataFrame, excel_pa
         if col in doc_df.columns:
             doc_df[col] = pd.to_datetime(doc_df[col], errors='coerce')
 
+    # Drop temporary raw extraction columns before writing Excel
+    cols_to_drop = ["FILE_HASH", "SOURCE_TAG", "RAW_CAYUSE_PROJ", "RAW_CAYUSE_PROP", "RAW_ORACLE_NUM"]
+    doc_excel_df = doc_df.drop(columns=[c for c in cols_to_drop if c in doc_df.columns])
+
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         recon_df.to_excel(writer, sheet_name="3Way_Reconciliation", index=False)
-        doc_df.to_excel(writer, sheet_name="Document_Level_Detail", index=False)
+        doc_excel_df.to_excel(writer, sheet_name="Document_Level_Detail", index=False)
 
     wb = openpyxl.load_workbook(excel_path)
     
@@ -740,11 +823,9 @@ def export_audit_workbook(recon_df: pd.DataFrame, doc_df: pd.DataFrame, excel_pa
             cell = ws_docs.cell(row=row, column=col_idx)
             val_str = str(cell.value) if cell.value else ""
             
-            # Date Formatting
             if "DATE" in str(h) and cell.value:
                 cell.number_format = 'm/d/yyyy'
 
-            # Clickable Path Hyperlink Formatting
             if str(h) in path_cols and val_str and val_str not in ("N/A", "nan", "None", ""):
                 file_uri = "file:///" + val_str.replace("\\", "/")
                 cell.hyperlink = file_uri
@@ -779,28 +860,30 @@ def main():
         if idx % 1000 == 0 or idx == len(pdf_tuples):
             print(f" -> Processed {idx}/{len(pdf_tuples)} documents...")
 
-    # 4. Deduplicate & Cross-Reference Folders
+    # 4. Dynamic Batch Crosswalk Resolution Pass
+    build_dynamic_crosswalk(extracted_documents)
+
+    # 5. Deduplicate & Cross-Reference Folders
     merged_documents = deduplicate_and_merge_sources(extracted_documents)
     print(f"Deduplication complete: {len(merged_documents)} unique logical document actions identified.")
 
-    # 5. Group by Award Cluster Key
+    # 6. Group by Unified Award Cluster Key
     clusters: Dict[str, List[Dict[str, Any]]] = {}
     for doc in merged_documents:
         ckey = doc["AWARD_CLUSTER_KEY"]
         clusters.setdefault(ckey, []).append(doc)
         
-    # 6. Pass 2 & Pass 3 Portfolio Synthesis
+    # 7. Pass 2 & Pass 3 Portfolio Synthesis
     reconciliation_results = []
     for ckey, doc_list in clusters.items():
         synth = synthesize_portfolio_pass_2(doc_list, system_baselines)
         reconciliation_results.append(synth)
 
-    # 7. SQLite Staging Export
+    # 8. SQLite Staging Export
     conn = sqlite3.connect(OUTPUT_SQLITE_PATH)
     doc_df = pd.DataFrame(merged_documents)
     recon_df = pd.DataFrame(reconciliation_results)
 
-    # Format date columns to string for SQLite
     doc_db_df = doc_df.copy()
     for col in ["EXECUTION_DATE", "DOC_START_DATE", "DOC_END_DATE"]:
         if col in doc_db_df.columns:
@@ -811,15 +894,14 @@ def main():
         if col in recon_db_df.columns:
             recon_db_df[col] = recon_db_df[col].astype(str)
 
-    # Remove temporary helper columns before database export
-    if "FILE_HASH" in doc_db_df.columns:
-        doc_db_df = doc_db_df.drop(columns=["FILE_HASH", "SOURCE_TAG"])
+    cols_to_drop_db = ["FILE_HASH", "SOURCE_TAG", "RAW_CAYUSE_PROJ", "RAW_CAYUSE_PROP", "RAW_ORACLE_NUM"]
+    doc_db_df = doc_db_df.drop(columns=[c for c in cols_to_drop_db if c in doc_db_df.columns])
 
     doc_db_df.to_sql("tbl_Documents", conn, if_exists="replace", index=False)
     recon_db_df.to_sql("tbl_Reconciliation_Summary", conn, if_exists="replace", index=False)
     conn.close()
 
-    # 8. Export Enhanced Excel Workbook
+    # 9. Export Enhanced Excel Workbook
     export_audit_workbook(recon_df, doc_df, OUTPUT_EXCEL_PATH)
 
     print(f"\nPipeline Execution Complete!")
