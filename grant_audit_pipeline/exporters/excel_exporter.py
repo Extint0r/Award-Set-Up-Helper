@@ -3,7 +3,9 @@ import pandas as pd
 import json
 from pathlib import Path
 from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
 
 def sanitize_complex_types_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -20,6 +22,7 @@ def sanitize_complex_types_for_excel(df: pd.DataFrame) -> pd.DataFrame:
             )
     return df_clean
 
+
 def export_audit_workbook(
     recon_df: pd.DataFrame, 
     header_df: pd.DataFrame, 
@@ -27,15 +30,17 @@ def export_audit_workbook(
     excel_path: Path
 ):
     """
-    Exports audit results into 3 relational sheets:
-    1. 3Way_Reconciliation: Compliance & Audit Verdicts
+    STAGE 5: Enhanced Output & Report Synchronization Engine
+    
+    Exports audit results into 3 relational sheets with professional openpyxl formatting:
+    1. 3Way_Reconciliation: Executive Compliance Verdicts & Audit Flags
     2. Award_Headers: Macro Award Metadata & Multi-Year Ceilings
-    3. Transaction_Ledger: Discrete NOA Increments & Actions with Column Segregation & Deduplication Flags
+    3. Transaction_Ledger: Itemized Actions with Currency, Date, and Conditional Formatting
     """
     excel_path.parent.mkdir(parents=True, exist_ok=True)
     
     # 1. Format datetime columns cleanly
-    for col in ["PDF_START_DATE_TRUTH", "PDF_END_DATE_TRUTH"]:
+    for col in ["PDF_START_DATE_TRUTH", "PDF_END_DATE_TRUTH", "PROJECT_START_DATE", "PROJECT_END_DATE"]:
         if col in recon_df.columns:
             recon_df[col] = pd.to_datetime(recon_df[col], format='mixed', errors='coerce')
         if col in header_df.columns:
@@ -59,14 +64,31 @@ def export_audit_workbook(
 
     wb = openpyxl.load_workbook(excel_path)
     
-    # 4. Apply Excel Tables & Short Date Formats across all 3 sheets
+    # Define Fills and Fonts for Status Highlighting
+    fill_green  = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid") # Soft Green
+    font_green  = Font(color="375623", bold=True)
+    
+    fill_red    = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid") # Soft Red/Orange
+    font_red    = Font(color="C65911", bold=True)
+    
+    fill_gray   = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid") # Soft Gray
+    font_gray   = Font(color="595959", italic=True)
+
+    fill_yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid") # Soft Yellow
+    font_yellow = Font(color="7F6000")
+
     sheet_tables = [
         ("3Way_Reconciliation", "Table_3Way_Reconciliation"),
         ("Award_Headers", "Table_Award_Headers"),
         ("Transaction_Ledger", "Table_Transaction_Ledger")
     ]
 
+    currency_keywords = ["AMOUNT", "OBLIGATED", "CEILING", "BUDGET", "DIRECT", "INDIRECT", "TOTAL"]
+
     for sheet_name, table_name in sheet_tables:
+        if sheet_name not in wb.sheetnames:
+            continue
+
         ws = wb[sheet_name]
         tab = Table(displayName=table_name, ref=ws.dimensions)
         tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
@@ -78,14 +100,51 @@ def export_audit_workbook(
         for row in range(2, ws.max_row + 1):
             for col_idx, h in enumerate(headers, 1):
                 cell = ws.cell(row=row, column=col_idx)
-                val_str = str(cell.value) if cell.value else ""
+                val_str = str(cell.value) if cell.value is not None else ""
+                h_str = str(h).upper()
 
-                if ("DATE" in str(h) or "START" in str(h) or "END" in str(h)) and cell.value:
+                # Date Formatting
+                if ("DATE" in h_str or "START" in h_str or "END" in h_str) and cell.value and not isinstance(cell.value, str):
                     cell.number_format = 'm/d/yyyy'
 
+                # Currency Formatting
+                if any(kw in h_str for kw in currency_keywords) and isinstance(cell.value, (int, float)):
+                    cell.number_format = '$#,##0.00'
+
+                # Hyperlink Formatting for File Paths
                 if str(h) in path_cols and val_str and val_str not in ("N/A", "nan", "None", ""):
                     file_uri = "file:///" + val_str.replace("\\", "/")
                     cell.hyperlink = file_uri
                     cell.font = Font(color="0000FF", underline="single")
+
+                # Conditional Verdict & Status Highlights
+                if h_str in ("RECONCILIATION_VERDICT", "AUDIT_STATUS"):
+                    if cell.value == "IN_SYNC":
+                        cell.fill = fill_green
+                        cell.font = font_green
+                    elif cell.value in ("FLAG_CEILING_BREACH", "HUMAN_REVIEW_REQUIRED", "BOTH_OUT_OF_SYNC", "ORACLE_OUT_OF_SYNC", "CAYUSE_OUT_OF_SYNC"):
+                        cell.fill = fill_red
+                        cell.font = font_red
+
+                if h_str == "LEDGER_ACTION_STATUS":
+                    if cell.value == "PRIMARY_ACTIVE_ACTION":
+                        cell.fill = fill_green
+                        cell.font = font_green
+                    elif cell.value == "DUPLICATE_SHADOW_RECORD":
+                        cell.fill = fill_gray
+                        cell.font = font_gray
+                    elif cell.value == "NON_BINDING_RECORD":
+                        cell.fill = fill_yellow
+                        cell.font = font_yellow
+
+        # Auto-adjust column widths
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                val = str(cell.value) if cell.value is not None else ""
+                if len(val) > max_len:
+                    max_len = len(val)
+            ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 60)
 
     wb.save(excel_path)

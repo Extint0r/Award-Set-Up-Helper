@@ -14,6 +14,21 @@ from config import (
 from parsers.table_finder import extract_budget_from_pdf_tables
 from parsers.vision_parser import parse_budget_table_with_vision
 
+# Regex patterns for De-obligation & Administrative Action filtering
+RE_DEOBLIGATION_PATTERNS = re.compile(
+    r'\b(?:de-?obligat(?:ion|ed|e)|funding\s+reduction|reduction\s+of\s+funds|decrease\s+award|net\s+reduction|de-?commit(?:ment)?)\b|'
+    r'\(\s*\$\s*[\d,]+(?:\.\d{2})?\s*\)',
+    re.IGNORECASE
+)
+
+RE_ADMIN_MOD_PATTERNS = re.compile(
+    r'\b(?:pi\s+change|change\s+of\s+pi|principal\s+investigator\s+change|'
+    r'key\s+personnel|administrative\s+amendment|administrative\s+modification|'
+    r'scope\s+change|change\s+in\s+scope|institutional\s+name\s+change|'
+    r'address\s+change|no-cost\s+amendment)\b',
+    re.IGNORECASE
+)
+
 
 def compute_file_hash(pdf_path: Path) -> str:
     """Computes MD5 hash for exact binary duplicate matching."""
@@ -125,12 +140,14 @@ def check_subcontract_out(filename: str, body_text: str = "") -> bool:
 
 def classify_document_type(filename: str, body_text: str = "") -> Tuple[str, bool]:
     """
-    Classifies documents into 7 granular categories and determines whether 
-    the document represents a binding funder financial action.
+    IMMUTABLE CLASSIFICATION ENGINE (Stage 2):
+    Classifies documents into granular categories and determines binding status.
+    This category is immutable and will not be mutated downstream based on parsed values.
     
     Returns: (action_category, is_binding_financial_action)
     """
     fn = str(filename)
+    header_text = body_text[:3000]
     
     # 1. Outgoing Subcontracts
     if check_subcontract_out(fn, body_text):
@@ -151,12 +168,20 @@ def classify_document_type(filename: str, body_text: str = "") -> Tuple[str, boo
     # 5. Technical Narratives
     if re.search(r'-tech|Tech-chgs', fn, re.IGNORECASE):
         return ("TECHNICAL_NARRATIVE", False)
-        
-    # 6. No-Cost Extensions
+
+    # 6. De-obligation Actions (Binding Financial Action with Negative Funding)
+    if RE_DEOBLIGATION_PATTERNS.search(fn) or RE_DEOBLIGATION_PATTERNS.search(header_text):
+        return ("DEOBLIGATION", True)
+
+    # 7. Non-Financial Administrative Modifications
+    if RE_ADMIN_MOD_PATTERNS.search(fn) or RE_ADMIN_MOD_PATTERNS.search(header_text):
+        return ("ADMINISTRATIVE_MODIFICATION", False)
+
+    # 8. No-Cost Extensions (Non-financial period extensions)
     if re.search(r'\b(?:NCE|No\s*Cost\s*Extension)\b', fn, re.IGNORECASE) or re.search(r'NO[-_\s]*COST[-_\s]*EXTENSION', body_text[:2000], re.IGNORECASE):
-        return ("NO_COST_EXTENSION", True)
+        return ("NO_COST_EXTENSION", False)
         
-    # 7. Official Notice of Award / Sponsor Notice
+    # 9. Official Notice of Award / Sponsor Notice
     return ("OFFICIAL_NOA", True)
 
 
@@ -275,7 +300,7 @@ def process_document_pass_1(
         if cfda_txt:
             aln_number = cfda_txt.group(1)
 
-    # 3. Action Type & Document Classification
+    # 3. IMMUTABLE Action Type & Document Classification (Stage 2)
     action_category, is_binding_financial_action = classify_document_type(filename, body_text)
 
     # 4. Header Financial & Date Extraction
@@ -303,7 +328,7 @@ def process_document_pass_1(
     ceiling_match = RE_CEILING_AMOUNT.search(header_scope)
     doc_ceiling = era_ceil or (parse_dollar_amount(ceiling_match.group(1)) if ceiling_match else 0.0)
 
-    # 5. Budget Table Parsing & Fallbacks
+    # 5. Budget Table Parsing & Context-Scoped Fallbacks (Stage 3)
     has_budget_table = len(budget_pages) > 0 or (bool(body_text) and any(kw in body_text.lower() for kw in BUDGET_PAGE_KEYWORDS))
     if has_budget_table and not budget_pages:
         budget_pages = [1]
@@ -357,7 +382,9 @@ def process_document_pass_1(
     else:
         budget_split_status = action_category
 
-    # Subaward Prime Award Ceiling Override Guardrail
+    # GUARDRAIL 1: Subaward Prime Federal Grant Ceiling Isolation
+    # If header contains multi-million prime total (> $1M) while local direct/indirect table is subaward level (< $500k),
+    # re-anchor obligation to local direct + indirect subrecipient costs.
     if re.search(r'(?:sub|amd|ucsf|bcm|uthsc)', filename, re.IGNORECASE):
         if extracted_delta > 1000000 and 0 < table_direct < 500000:
             subaward_action_tot = table_direct + table_indirect if (table_direct + table_indirect) > 0 else table_direct
@@ -365,18 +392,27 @@ def process_document_pass_1(
                 extracted_delta = subaward_action_tot
                 budget_split_status = "REANCHORED_SUBAWARD_TOTAL"
 
-    # Guardrail: A No-Cost Extension cannot carry positive obligation funding (> $0).
-    if action_category == "NO_COST_EXTENSION" and extracted_delta > 0.0:
-        action_category = "OFFICIAL_NOA"
-        is_binding_financial_action = True
+    # GUARDRAIL 2: De-obligation Negative Delta Normalization
+    if action_category == "DEOBLIGATION":
+        if extracted_delta > 0.0:
+            extracted_delta = -abs(extracted_delta)
+        budget_split_status = "ENFORCED_DEOBLIGATION_NEGATIVE"
 
-    # Column Segregation Logic based on Binding Status
-    if is_binding_financial_action:
+    # GUARDRAIL 3: Strict NCE Non-Financial Enforcement (IMMUTABLE)
+    # Category stays NO_COST_EXTENSION, obligation delta is hardcoded to 0.00, numbers route to reported budget.
+    if action_category == "NO_COST_EXTENSION":
+        non_binding_reported_budget = extracted_delta or table_total
+        delta_obligated = 0.00
+        doc_ceiling = 0.00
+        budget_split_status = "NCE_NON_FINANCIAL_RESTATED_BUDGET"
+
+    # GUARDRAIL 4: Column Segregation based on Binding Status
+    elif is_binding_financial_action:
         delta_obligated = extracted_delta
-        non_binding_reported_budget = 0.0
+        non_binding_reported_budget = 0.00
     else:
-        delta_obligated = 0.0
-        doc_ceiling = 0.0
+        delta_obligated = 0.00
+        doc_ceiling = 0.00
         non_binding_reported_budget = extracted_delta or table_total
 
     master_metadata = {

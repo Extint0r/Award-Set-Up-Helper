@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Any
 
+
 def sanitize_complex_types_for_sqlite(df: pd.DataFrame) -> pd.DataFrame:
     """
     Converts lists, dicts, and complex objects (e.g., DATE_SNIPPETS, BUDGET_PAGES)
@@ -18,6 +19,7 @@ def sanitize_complex_types_for_sqlite(df: pd.DataFrame) -> pd.DataFrame:
                 lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict)) else ("" if pd.isna(x) else str(x))
             )
     return df_clean
+
 
 def export_to_sqlite(
     headers: List[Dict[str, Any]], 
