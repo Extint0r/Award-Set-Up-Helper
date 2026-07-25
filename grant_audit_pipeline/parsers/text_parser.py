@@ -63,7 +63,7 @@ def extract_header_date_context(text: str, max_chars: int = 5000, window: int = 
     if not text or not isinstance(text, str):
         return []
 
-    date_pattern = r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}|\d{4}-\d{2}-\d{2})\b'
+    date_pattern = r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})\b'
     
     header_text = text[:max_chars]
     snippets = []
@@ -71,7 +71,7 @@ def extract_header_date_context(text: str, max_chars: int = 5000, window: int = 
     for match in re.finditer(date_pattern, header_text, re.IGNORECASE):
         start = max(0, match.start() - window)
         end = min(len(header_text), match.end() + window)
-        snippet = " ".join(header_text[start:end].split())  # Clean extra whitespace/newlines
+        snippet = " ".join(header_text[start:end].split())
         
         snippets.append({
             "date": match.group(0),
@@ -90,12 +90,10 @@ def parse_dates_from_snippets(snippets: List[Dict[str, str]]) -> Dict[str, Optio
         return {'start_date': None, 'end_date': None, 'exec_date': None}
 
     full_snippet_text = " ".join([s.get("context", "") for s in snippets if isinstance(s, dict)])
-    
-    date_pat = r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}|\d{4}-\d{2}-\d{2})\b'
+    date_pat = r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})\b'
     
     extracted = {'start_date': None, 'end_date': None, 'exec_date': None}
 
-    # 1. Budget Period Range Match (e.g., "Budget Period: 04/01/2025 - 03/31/2026")
     budget_match = re.search(
         r'(?:Budget\s*Period|Current\s*Budget)\b.{0,60}?(?P<start>' + date_pat + r').{0,30}?(?:to|through|-|–|End\s*Date)\s*(?P<end>' + date_pat + r')', 
         full_snippet_text, re.IGNORECASE
@@ -104,7 +102,6 @@ def parse_dates_from_snippets(snippets: List[Dict[str, str]]) -> Dict[str, Optio
         extracted['start_date'] = budget_match.group('start')
         extracted['end_date'] = budget_match.group('end')
 
-    # 2. Execution / Issue Date Match (e.g., "Award Date: 04/18/2023")
     exec_match = re.search(
         r'(?:Award\s*Date|Issue\s*Date|Date\s*Issued|Federal\s*Award\s*Date)\b.{0,30}?(?P<exec>' + date_pat + r')', 
         full_snippet_text, re.IGNORECASE
@@ -115,12 +112,56 @@ def parse_dates_from_snippets(snippets: List[Dict[str, str]]) -> Dict[str, Optio
     return extracted
 
 
+def check_subcontract_out(filename: str, body_text: str = "") -> bool:
+    """Strictly checks if a document represents an outgoing subcontract."""
+    if re.search(r'(?<![A-Za-z0-9])(?:Sub-[A-Za-z0-9\-_]+|SubA|Subaward|Subcontract)(?![A-Za-z0-9])', filename, re.IGNORECASE):
+        return True
+    
+    if re.search(r'SUBCONTRACT\s*OUT.{0,100}?[☒\[X\]]\s*YES', body_text, re.DOTALL | re.IGNORECASE):
+        return True
+        
+    return False
+
+
+def classify_document_type(filename: str, body_text: str = "") -> Tuple[str, bool]:
+    """
+    Classifies documents into 7 granular categories and determines whether 
+    the document represents a binding funder financial action.
+    
+    Returns: (action_category, is_binding_financial_action)
+    """
+    fn = str(filename)
+    
+    # 1. Outgoing Subcontracts
+    if check_subcontract_out(fn, body_text):
+        return ("SUBCONTRACT_OUT", False)
+        
+    # 2. Internal Advance Spend / Pre-Award Risk Authorizations
+    if re.search(r'advspd|advance\s*spend|pre-?award', fn, re.IGNORECASE):
+        return ("INTERNAL_ADVANCE_SPEND", False)
+
+    # 3. Recipient Progress Reports (RPPR / Progress Report)
+    if re.search(r'(?:^|[-_.\s])PR(?:[-_.\s]|$)|RPPR|ProgressReport', fn, re.IGNORECASE) or re.search(r'\bRPPR\b|Research\s+Performance\s+Progress\s+Report', body_text[:2000], re.IGNORECASE):
+        return ("RECIPIENT_PROGRESS_REPORT", False)
+        
+    # 4. Informal Rebudgets, Proposals, Internal Drafts
+    if re.search(r'no-notice|revbud|draft|internal|work-in-progress', fn, re.IGNORECASE):
+        return ("PROPOSAL_OR_REVISED_BUDGET", False)
+        
+    # 5. Technical Narratives
+    if re.search(r'-tech|Tech-chgs', fn, re.IGNORECASE):
+        return ("TECHNICAL_NARRATIVE", False)
+        
+    # 6. No-Cost Extensions
+    if re.search(r'\b(?:NCE|No\s*Cost\s*Extension)\b', fn, re.IGNORECASE) or re.search(r'NO[-_\s]*COST[-_\s]*EXTENSION', body_text[:2000], re.IGNORECASE):
+        return ("NO_COST_EXTENSION", True)
+        
+    # 7. Official Notice of Award / Sponsor Notice
+    return ("OFFICIAL_NOA", True)
+
+
 def parse_osr_matrix_grid(body_text: str) -> Tuple[float, float, float, float]:
-    """
-    Parses the 4-column AWARDS grid on OSR Award Data Sheets (2014-2018)
-    by reading ordered TOTAL, Direct, and Indirect arrays from body text.
-    Returns: (Current Action Direct, Current Action Indirect, Current Action Total, Total Project Ceiling)
-    """
+    """Parses the 4-column AWARDS grid on OSR Award Data Sheets (2014-2018)."""
     direct, indirect, total, ceiling = 0.0, 0.0, 0.0, 0.0
     
     if "AWARDS" in body_text or "Award Data Sheet" in body_text or "A. Current Action" in body_text:
@@ -130,7 +171,6 @@ def parse_osr_matrix_grid(body_text: str) -> Tuple[float, float, float, float]:
         
         if totals:
             total = parse_dollar_amount(totals[0])
-            
         if len(totals) >= 4:
             ceiling = parse_dollar_amount(totals[3])
         elif len(totals) >= 2 and ceiling == 0.0:
@@ -138,21 +178,14 @@ def parse_osr_matrix_grid(body_text: str) -> Tuple[float, float, float, float]:
             
         if directs:
             direct = parse_dollar_amount(directs[0])
-            
         if indirects:
             indirect = parse_dollar_amount(indirects[0])
             
     return direct, indirect, total, ceiling
 
 
-def route_era_budget_extraction(
-    body_text: str, 
-    yy_year: Optional[int]
-) -> Tuple[float, float, float, float, str]:
-    """
-    Routes document body text to era-specific extraction routines based on YY year.
-    Returns: (direct, indirect, total, ceiling, era_template_tag)
-    """
+def route_era_budget_extraction(body_text: str, yy_year: Optional[int]) -> Tuple[float, float, float, float, str]:
+    """Routes document body text to era-specific extraction routines based on YY year."""
     direct, indirect, total, ceiling = 0.0, 0.0, 0.0, 0.0
     template_tag = "GENERIC_KEY_VALUE"
 
@@ -176,17 +209,6 @@ def route_era_budget_extraction(
             total = parse_dollar_amount(tot_m.group(1))
 
     return direct, indirect, total, ceiling, template_tag
-
-
-def check_subcontract_out(filename: str, body_text: str) -> bool:
-    """Strictly checks if a document represents an outgoing subcontract."""
-    if re.search(r'(?<![A-Za-z0-9])(?:Sub-[A-Za-z0-9\-_]+|SubA|Subaward|Subcontract)(?![A-Za-z0-9])', filename, re.IGNORECASE):
-        return True
-    
-    if re.search(r'SUBCONTRACT\s*OUT\s*[\r\n\s]*[☒\[X\]]\s*YES', body_text, re.IGNORECASE):
-        return True
-        
-    return False
 
 
 def process_document_pass_1(
@@ -240,10 +262,7 @@ def process_document_pass_1(
         except Exception:
             body_text = ""
 
-    # Contextual date snippet extraction (Runs AFTER body_text is assigned)
     date_snippets = extract_header_date_context(body_text, max_chars=5000, window=200)
-
-    # Contextual Snippet Date Inference Fallback
     snippet_dates = parse_dates_from_snippets(date_snippets)
 
     if not raw_banner and body_text:
@@ -256,11 +275,8 @@ def process_document_pass_1(
         if cfda_txt:
             aln_number = cfda_txt.group(1)
 
-    # 3. Action Type & Subcontract Categorization
-    is_nce_action = bool(re.search(r'\b(?:NCE|No\s*Cost\s*Extension)\b', filename, re.IGNORECASE))
-    is_subcontract_out = check_subcontract_out(filename, body_text)
-
-    action_category = "SUBCONTRACT_OUT" if is_subcontract_out else ("NO_COST_EXTENSION" if is_nce_action else "PRIME_AWARD")
+    # 3. Action Type & Document Classification
+    action_category, is_binding_financial_action = classify_document_type(filename, body_text)
 
     # 4. Header Financial & Date Extraction
     header_scope = body_text[:4000] if body_text else ""
@@ -272,7 +288,6 @@ def process_document_pass_1(
     doc_start_date = parse_date(range_match.group(1)) if range_match else None
     doc_end_date = parse_date(range_match.group(2)) if range_match else None
 
-    # Apply Contextual Snippet Inferences if header regex was empty
     if not doc_start_date and snippet_dates['start_date']:
         doc_start_date = parse_date(snippet_dates['start_date'])
     if not doc_end_date and snippet_dates['end_date']:
@@ -280,11 +295,10 @@ def process_document_pass_1(
     if not execution_date and snippet_dates['exec_date']:
         execution_date = parse_date(snippet_dates['exec_date'])
 
-    # Route Era-Specific Budget Extraction on pure body text
     era_dir, era_ind, era_tot, era_ceil, era_template_tag = route_era_budget_extraction(body_text, cayuse_yy)
     
     obligated_match = RE_OBLIGATED_ACTION.search(header_scope)
-    delta_obligated = era_tot or (parse_dollar_amount(obligated_match.group(1)) if obligated_match else 0.0)
+    extracted_delta = era_tot or (parse_dollar_amount(obligated_match.group(1)) if obligated_match else 0.0)
     
     ceiling_match = RE_CEILING_AMOUNT.search(header_scope)
     doc_ceiling = era_ceil or (parse_dollar_amount(ceiling_match.group(1)) if ceiling_match else 0.0)
@@ -298,13 +312,9 @@ def process_document_pass_1(
     budget_split_status = "NO_BUDGET_TABLE"
     extraction_method = "PyMuPDF_Fast"
 
-    v_exec_date = None
-    v_budget_start = None
-    v_budget_end = None
-    v_proj_start = None
-    v_proj_end = None
+    v_exec_date, v_budget_start, v_budget_end, v_proj_start, v_proj_end = None, None, None, None, None
 
-    if has_budget_table and not is_nce_action and not is_subcontract_out:
+    if has_budget_table and is_binding_financial_action:
         if table_total == 0.0:
             tot_match = RE_BUDGET_TOTAL.search(body_text)
             ind_match = RE_INDIRECT_COST.search(body_text)
@@ -316,12 +326,9 @@ def process_document_pass_1(
         if table_total == 0.0:
             tb_direct, tb_indirect, tb_total = extract_budget_from_pdf_tables(pdf_path)
             if tb_total > 0:
-                table_direct = tb_direct
-                table_indirect = tb_indirect
-                table_total = tb_total
+                table_direct, table_indirect, table_total = tb_direct, tb_indirect, tb_total
 
         if ENABLE_VISION_FALLBACK and budget_pages:
-            # Guarantee Page 1 (NoA Cover Page with Boxes 19/20/26/27) is inspected
             target_vision_page = 1 if (1 in budget_pages or not budget_pages) else budget_pages[0]
             v_res = parse_budget_table_with_vision(pdf_path, target_vision_page)
             if v_res.get("VISION_EVAL_STATUS") == "PASSED" and v_res.get("VISION_PARSED_TOTAL", 0.0) > 0:
@@ -342,17 +349,35 @@ def process_document_pass_1(
             if table_direct == 0.0:
                 table_direct = max(0.0, table_total - table_indirect)
             
-            if delta_obligated == 0.0 or (delta_obligated < 1000 and table_total >= 10000) or (delta_obligated / table_total < 0.01):
-                delta_obligated = table_total
+            if extracted_delta == 0.0 or (extracted_delta < 1000 and table_total >= 10000) or (extracted_delta / table_total < 0.01):
+                extracted_delta = table_total
                 budget_split_status = "FALLBACK_TABLE_TOTAL"
             else:
-                budget_split_status = "MATCHED_HEADER" if abs(table_total - delta_obligated) < 1.0 else "PARTIAL_OR_UNMATCHED"
-    elif is_nce_action:
-        budget_split_status = "NO_COST_EXTENSION"
-    elif is_subcontract_out:
-        budget_split_status = "SUBCONTRACT_OUT"
+                budget_split_status = "MATCHED_HEADER" if abs(table_total - extracted_delta) < 1.0 else "PARTIAL_OR_UNMATCHED"
+    else:
+        budget_split_status = action_category
 
-    action_tag = "NCE" if is_nce_action else ("Subcontract" if is_subcontract_out else "Standard Award")
+    # Subaward Prime Award Ceiling Override Guardrail
+    if re.search(r'(?:sub|amd|ucsf|bcm|uthsc)', filename, re.IGNORECASE):
+        if extracted_delta > 1000000 and 0 < table_direct < 500000:
+            subaward_action_tot = table_direct + table_indirect if (table_direct + table_indirect) > 0 else table_direct
+            if subaward_action_tot > 0:
+                extracted_delta = subaward_action_tot
+                budget_split_status = "REANCHORED_SUBAWARD_TOTAL"
+
+    # Guardrail: A No-Cost Extension cannot carry positive obligation funding (> $0).
+    if action_category == "NO_COST_EXTENSION" and extracted_delta > 0.0:
+        action_category = "OFFICIAL_NOA"
+        is_binding_financial_action = True
+
+    # Column Segregation Logic based on Binding Status
+    if is_binding_financial_action:
+        delta_obligated = extracted_delta
+        non_binding_reported_budget = 0.0
+    else:
+        delta_obligated = 0.0
+        doc_ceiling = 0.0
+        non_binding_reported_budget = extracted_delta or table_total
 
     master_metadata = {
         "original_filename": filename,
@@ -365,14 +390,15 @@ def process_document_pass_1(
         "cayuse_yy": cayuse_yy,
         "era_template_tag": era_template_tag,
         "lead_pi": lead_pi,
-        "action_tag": action_tag,
         "action_category": action_category,
+        "is_binding_financial_action": is_binding_financial_action,
         "aln_number": aln_number,
         "execution_date": execution_date.strftime("%Y-%m-%d") if execution_date else "",
         "doc_start_date": doc_start_date.strftime("%Y-%m-%d") if doc_start_date else "",
         "doc_end_date": doc_end_date.strftime("%Y-%m-%d") if doc_end_date else "",
         "delta_obligated": delta_obligated,
         "doc_ceiling": doc_ceiling,
+        "non_binding_reported_budget": non_binding_reported_budget,
         "has_budget_table": has_budget_table,
         "budget_pages": budget_pages,
         "budget_split_status": budget_split_status,
@@ -405,11 +431,13 @@ def process_document_pass_1(
         "CAYUSE_YY": cayuse_yy,
         "ERA_TEMPLATE_TAG": era_template_tag,
         "ACTION_CATEGORY": action_category,
+        "IS_BINDING_FINANCIAL_ACTION": is_binding_financial_action,
         "EXECUTION_DATE": execution_date,
         "DOC_START_DATE": doc_start_date,
         "DOC_END_DATE": doc_end_date,
         "DELTA_OBLIGATED": delta_obligated,
         "DOC_CEILING": doc_ceiling,
+        "NON_BINDING_REPORTED_BUDGET": non_binding_reported_budget,
         "HAS_BUDGET_TABLE": has_budget_table,
         "TABLE_TOTAL": table_total,
         "TABLE_DIRECT": table_direct,

@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 import pandas as pd
+import re
 
 # Add module path
 sys.path.append(str(Path(__file__).parent))
@@ -20,8 +21,8 @@ from exporters.excel_exporter import export_audit_workbook
 def aggregate_cluster_reconciliation(doc_list: list) -> dict:
     """
     Aggregates document-level extractions into cluster-level truth 
-    with floating active ceiling logic, initial award tracking, 
-    and human-in-the-loop review flags for true ceiling breaches.
+    with explicit distinction between TOTAL_AWARDED_AMOUNT (max stated project ceiling)
+    and INITIAL_OBLIGATED_AMOUNT (Year 1 funded budget).
     """
     if not doc_list:
         return {}
@@ -29,7 +30,6 @@ def aggregate_cluster_reconciliation(doc_list: list) -> dict:
     df_docs = pd.DataFrame(doc_list)
     cluster_key = df_docs['AWARD_CLUSTER_KEY'].iloc[0] if 'AWARD_CLUSTER_KEY' in df_docs.columns else "UNKNOWN"
     
-    # Extract identifiers if present in metadata
     cayuse_proj = (
         df_docs['CAYUSE_PROJECT_NUMBER'].dropna().iloc[0] 
         if 'CAYUSE_PROJECT_NUMBER' in df_docs.columns and not df_docs['CAYUSE_PROJECT_NUMBER'].dropna().empty 
@@ -41,53 +41,40 @@ def aggregate_cluster_reconciliation(doc_list: list) -> dict:
         else None
     )
 
-    # 1. Ensure optional Vision columns exist in DataFrame schema
     for col in ["VISION_BUDGET_START", "VISION_PROJECT_END", "VISION_EXECUTION_DATE"]:
         if col not in df_docs.columns:
             df_docs[col] = None
 
-    # 2. Derive Effective Dates safely
-    df_docs['EFFECTIVE_BUDGET_START'] = (
+    if "IS_BINDING_FINANCIAL_ACTION" not in df_docs.columns:
+        df_docs["IS_BINDING_FINANCIAL_ACTION"] = df_docs["ACTION_CATEGORY"].isin(["OFFICIAL_NOA", "NO_COST_EXTENSION", "PRIME_AWARD"])
+
+    # Derive Effective Dates safely as uniform datetime64[ns]
+    df_docs['EFFECTIVE_BUDGET_START'] = pd.to_datetime(
         df_docs['VISION_BUDGET_START']
         .fillna(df_docs['DOC_START_DATE'])
-        .fillna(df_docs['EXECUTION_DATE'])
+        .fillna(df_docs['EXECUTION_DATE']),
+        format='mixed',
+        errors='coerce'
     )
     
-    df_docs['EFFECTIVE_PROJECT_END'] = (
+    df_docs['EFFECTIVE_PROJECT_END'] = pd.to_datetime(
         df_docs['VISION_PROJECT_END']
-        .fillna(df_docs['DOC_END_DATE'])
+        .fillna(df_docs['DOC_END_DATE']),
+        format='mixed',
+        errors='coerce'
     )
 
-    # System ledger values from Triage MASTER tab (Use .max() snapshot for system balances)
+    # System ledger values from Triage MASTER tab
     cayuse_ceiling = float(df_docs['CAYUSE_CEILING'].dropna().max()) if 'CAYUSE_CEILING' in df_docs.columns and not df_docs['CAYUSE_CEILING'].dropna().empty else 0.0
     cayuse_obligated = float(df_docs['CAYUSE_OBLIGATED'].dropna().max()) if 'CAYUSE_OBLIGATED' in df_docs.columns and not df_docs['CAYUSE_OBLIGATED'].dropna().empty else 0.0
     oracle_obligated = float(df_docs['ORACLE_OBLIGATED'].dropna().max()) if 'ORACLE_OBLIGATED' in df_docs.columns and not df_docs['ORACLE_OBLIGATED'].dropna().empty else 0.0
     oracle_ceiling = float(df_docs['ORACLE_CEILING'].dropna().max()) if 'ORACLE_CEILING' in df_docs.columns and not df_docs['ORACLE_CEILING'].dropna().empty else 0.0
 
-    # 3. Filter out non-prime (SUBCONTRACT_OUT) & non-official/internal docs for obligation math
-    action_cat_mask = (
-        df_docs['ACTION_CATEGORY'] != 'SUBCONTRACT_OUT' 
-        if 'ACTION_CATEGORY' in df_docs.columns 
-        else pd.Series(True, index=df_docs.index)
-    )
-    
-    filename_col = (
-        df_docs['Filename'].astype(str) 
-        if 'Filename' in df_docs.columns 
-        else df_docs['PDF_Path'].astype(str) if 'PDF_Path' in df_docs.columns else pd.Series("", index=df_docs.index)
-    )
-    
-    # Mask out draft worksheets, progress reports (RPPR/PR), technical narratives, and no-notice files
-    official_mask = ~filename_col.str.contains(
-        r'no-notice|revbud|draft|internal|work-in-progress|[-_\b]PR[-_\b]|RPPR|ProgressReport|-tech|Tech-chgs', 
-        case=False, 
-        na=False
-    )
-
-    is_prime_official = action_cat_mask & official_mask
+    # Filter strictly for IS_BINDING_FINANCIAL_ACTION == True for obligation math
+    is_prime_official = df_docs['IS_BINDING_FINANCIAL_ACTION'] == True
     df_financial_docs = df_docs[is_prime_official].copy()
 
-    # 4. Deduplicate identical NoA actions cleanly using effective budget start & delta
+    # Deduplicate identical NoA actions cleanly
     if not df_financial_docs.empty and 'DELTA_OBLIGATED' in df_financial_docs.columns:
         df_deduped_docs = df_financial_docs.drop_duplicates(
             subset=['AWARD_CLUSTER_KEY', 'EFFECTIVE_BUDGET_START', 'DELTA_OBLIGATED'],
@@ -96,59 +83,59 @@ def aggregate_cluster_reconciliation(doc_list: list) -> dict:
     else:
         df_deduped_docs = df_financial_docs
 
-    # 5. Derive PDF Financial Truths
+    # Derive PDF Financial Metrics
     pdf_obligated = float(df_deduped_docs['DELTA_OBLIGATED'].sum()) if 'DELTA_OBLIGATED' in df_deduped_docs.columns else 0.0
 
-    # Initial Award Amount = Earliest official NoA incremental obligation (Year 1)
     if not df_deduped_docs.empty and 'EFFECTIVE_BUDGET_START' in df_deduped_docs.columns:
         df_sorted_actions = df_deduped_docs.sort_values(by='EFFECTIVE_BUDGET_START', ascending=True)
-        initial_award_amount = float(df_sorted_actions['DELTA_OBLIGATED'].iloc[0])
+        initial_obligated_amount = float(df_sorted_actions['DELTA_OBLIGATED'].iloc[0])
     else:
-        initial_award_amount = 0.0
+        initial_obligated_amount = 0.0
 
-    # Declared project ceiling from official NoAs or Cayuse Master record
-    if 'DOC_CEILING' in df_docs.columns:
-        official_noas = df_docs[(df_docs['DOC_CEILING'] > 0) & official_mask]
-        declared_ceiling = float(official_noas['DOC_CEILING'].max()) if not official_noas.empty else cayuse_ceiling
+    declared_noa_ceilings = df_docs[(df_docs['DOC_CEILING'] > 0) & is_prime_official]['DOC_CEILING'].dropna() if 'DOC_CEILING' in df_docs.columns else pd.Series(dtype=float)
+    max_stated_noa_ceiling = float(declared_noa_ceilings.max()) if not declared_noa_ceilings.empty else 0.0
+
+    if max_stated_noa_ceiling > 0 and (cayuse_ceiling == 0 or max_stated_noa_ceiling >= cayuse_ceiling):
+        total_awarded_amount = max_stated_noa_ceiling
+    elif cayuse_ceiling > 0:
+        total_awarded_amount = cayuse_ceiling
     else:
-        declared_ceiling = cayuse_ceiling
+        total_awarded_amount = None
 
-    # Floating Active Ceiling = Ceiling expands upward as incremental NoAs accrue
-    pdf_active_ceiling = max(declared_ceiling, pdf_obligated)
+    if total_awarded_amount is not None:
+        pdf_active_ceiling = max(total_awarded_amount, pdf_obligated)
+    else:
+        pdf_active_ceiling = pdf_obligated
 
-    # Date horizon extraction
-    start_dates = pd.to_datetime(df_docs['EFFECTIVE_BUDGET_START'], format='mixed', errors='coerce').dropna()
-    end_dates = pd.to_datetime(df_docs['EFFECTIVE_PROJECT_END'], format='mixed', errors='coerce').dropna()
+    start_dates = df_docs['EFFECTIVE_BUDGET_START'].dropna()
+    end_dates = df_docs['EFFECTIVE_PROJECT_END'].dropna()
     
     pdf_start_date = start_dates.min() if not start_dates.empty else None
     pdf_end_date = end_dates.max() if not end_dates.empty else None
 
-    # 6. Evaluate Compliance & Human Review Triggers
     verdict = "IN_SYNC"
     audit_status = "IN_SYNC"
     discrepancy_reason = ""
     ceiling_breach = False
-    budget_expanded = (pdf_obligated > initial_award_amount)
+    budget_expanded = (pdf_obligated > initial_obligated_amount)
 
-    # ANOMALY CHECK: Cumulative obligations exceed declared multi-year project ceiling
-    if declared_ceiling > 0 and pdf_obligated > declared_ceiling:
+    if total_awarded_amount is not None and pdf_obligated > total_awarded_amount:
         ceiling_breach = True
         verdict = "FLAG_CEILING_BREACH"
         audit_status = "HUMAN_REVIEW_REQUIRED"
         discrepancy_reason = (
             f"ANOMALY DETECTED: Cumulative PDF obligated funds (${pdf_obligated:,.2f}) "
-            f"exceed total authorized project ceiling (${declared_ceiling:,.2f}). "
+            f"exceed max declared project ceiling (${total_awarded_amount:,.2f}). "
             f"Manual audit intervention required."
         )
     else:
-        # Ledger system reconciliation against benchmark metrics
         oracle_mismatch = (oracle_obligated > 0) and abs(oracle_obligated - pdf_obligated) > 1.0
-        cayuse_mismatch = (cayuse_ceiling > 0) and (pdf_active_ceiling > 0) and abs(cayuse_ceiling - pdf_active_ceiling) > 1.0
+        cayuse_mismatch = (cayuse_ceiling > 0) and abs(cayuse_ceiling - pdf_active_ceiling) > 1.0
 
         if oracle_mismatch and cayuse_mismatch:
             verdict = "BOTH_OUT_OF_SYNC"
             audit_status = "DISCREPANCY_DETECTED"
-            discrepancy_reason = f"Oracle obligated (${oracle_obligated:,.2f}) != PDF (${pdf_obligated:,.2f}) AND Cayuse ceiling (${cayuse_ceiling:,.2f}) != PDF ceiling (${pdf_active_ceiling:,.2f})."
+            discrepancy_reason = f"Oracle obligated (${oracle_obligated:,.2f}) != PDF (${pdf_obligated:,.2f}) AND Cayuse ceiling (${cayuse_ceiling:,.2f}) != PDF active ceiling (${pdf_active_ceiling:,.2f})."
         elif oracle_mismatch:
             verdict = "ORACLE_OUT_OF_SYNC"
             audit_status = "DISCREPANCY_DETECTED"
@@ -157,9 +144,11 @@ def aggregate_cluster_reconciliation(doc_list: list) -> dict:
             verdict = "CAYUSE_OUT_OF_SYNC"
             audit_status = "DISCREPANCY_DETECTED"
             discrepancy_reason = f"Cayuse ceiling (${cayuse_ceiling:,.2f}) does not match PDF active ceiling (${pdf_active_ceiling:,.2f})."
+        elif total_awarded_amount is None:
+            discrepancy_reason = f"NOTICE: Total Awarded Amount (project ceiling) not explicitly declared on NOAs/Cayuse. Active ceiling set to cumulative obligated (${pdf_obligated:,.2f})."
         elif budget_expanded:
             discrepancy_reason = (
-                f"INFORMATIONAL: Award budget expanded from initial award (${initial_award_amount:,.2f}) "
+                f"INFORMATIONAL: Award budget expanded from initial obligation (${initial_obligated_amount:,.2f}) "
                 f"to active cumulative total (${pdf_obligated:,.2f}). System ledgers in sync."
             )
 
@@ -170,7 +159,8 @@ def aggregate_cluster_reconciliation(doc_list: list) -> dict:
         "DOCUMENT_COUNT": len(doc_list),
         "PDF_START_DATE_TRUTH": pdf_start_date,
         "PDF_END_DATE_TRUTH": pdf_end_date,
-        "INITIAL_AWARD_AMOUNT": initial_award_amount,
+        "TOTAL_AWARDED_AMOUNT": total_awarded_amount,
+        "INITIAL_OBLIGATED_AMOUNT": initial_obligated_amount,
         "PDF_CUMULATIVE_OBLIGATED": pdf_obligated,
         "PDF_ACTIVE_CEILING": pdf_active_ceiling,
         "CAYUSE_OBLIGATED": cayuse_obligated,
@@ -182,6 +172,108 @@ def aggregate_cluster_reconciliation(doc_list: list) -> dict:
         "AUDIT_STATUS": audit_status,
         "RECONCILIATION_VERDICT": verdict,
         "DISCREPANCY_REASON": discrepancy_reason
+    }
+
+
+def build_transaction_ledger(doc_list: list) -> list:
+    """
+    Transforms raw document extractions into a clean, relational transaction ledger 
+    with explicit deduplication tracking and column segregation.
+    """
+    transactions = []
+    seen_actions = set()
+
+    for doc in doc_list:
+        ckey = str(doc.get("AWARD_CLUSTER_KEY", "UNKNOWN"))
+        filename = str(doc.get("Filename", ""))
+        action_cat = str(doc.get("ACTION_CATEGORY", "OFFICIAL_NOA"))
+        is_binding = bool(doc.get("IS_BINDING_FINANCIAL_ACTION", True))
+        
+        raw_delta = float(doc.get("DELTA_OBLIGATED") or 0.0)
+        raw_ceiling = float(doc.get("DOC_CEILING") or 0.0)
+        raw_non_binding = float(doc.get("NON_BINDING_REPORTED_BUDGET") or 0.0)
+        
+        # 1. Strict NCE Guardrail: Explicit NCE filenames cannot carry positive obligation funding
+        if re.search(r'\bNCE\b|No\s*Cost\s*Extension', filename, re.IGNORECASE):
+            action_cat = "NO_COST_EXTENSION"
+            is_binding = True
+            raw_delta = 0.0
+
+        # 2. Date key fallback for deduplication (Budget Start -> Action Date -> Execution Date)
+        eff_start = pd.to_datetime(
+            doc.get("VISION_BUDGET_START") or doc.get("DOC_START_DATE") or doc.get("ACTION_DATE") or doc.get("EXECUTION_DATE") or doc.get("VISION_EXECUTION_DATE"),
+            format='mixed', errors='coerce'
+        )
+        eff_start_str = eff_start.strftime("%Y-%m-%d") if pd.notna(eff_start) else "NO_DATE"
+
+        # 3. Duplicate Shadow Record Check
+        if is_binding and raw_delta > 0:
+            action_key = (ckey, eff_start_str, round(raw_delta, 2))
+            if action_key in seen_actions:
+                status = "DUPLICATE_SHADOW_RECORD"
+                included = False
+                obligation_amt = 0.0
+                stated_ceiling = 0.0
+                non_binding_amt = raw_delta
+            else:
+                seen_actions.add(action_key)
+                status = "PRIMARY_ACTIVE_ACTION"
+                included = True
+                obligation_amt = raw_delta
+                stated_ceiling = raw_ceiling
+                non_binding_amt = 0.0
+        elif is_binding:
+            status = "PRIMARY_ACTIVE_ACTION"
+            included = True
+            obligation_amt = 0.0
+            stated_ceiling = raw_ceiling
+            non_binding_amt = 0.0
+        else:
+            status = "NON_BINDING_RECORD"
+            included = False
+            obligation_amt = 0.0
+            stated_ceiling = 0.0
+            non_binding_amt = raw_delta or raw_non_binding or float(doc.get("TABLE_TOTAL") or 0.0)
+
+        transactions.append({
+            "TRANSACTION_ID": doc.get("FILE_HASH") or doc.get("Filename"),
+            "AWARD_CLUSTER_KEY": doc.get("AWARD_CLUSTER_KEY"),
+            "ORACLE_AWARD_NUMBER": doc.get("ORACLE_AWARD_NUMBER"),
+            "CAYUSE_PROJECT_NUMBER": doc.get("CAYUSE_PROJECT_NUMBER"),
+            "FILENAME": doc.get("Filename"),
+            "ACTION_CATEGORY": action_cat,
+            "IS_BINDING_FINANCIAL_ACTION": is_binding,
+            "LEDGER_ACTION_STATUS": status,
+            "INCLUDED_IN_CUMULATIVE_TOTAL": included,
+            "ACTION_DATE": doc.get("EXECUTION_DATE") or doc.get("VISION_EXECUTION_DATE"),
+            "BUDGET_PERIOD_START": doc.get("DOC_START_DATE") or doc.get("VISION_BUDGET_START"),
+            "BUDGET_PERIOD_END": doc.get("DOC_END_DATE") or doc.get("VISION_BUDGET_END"),
+            "OBLIGATION_ACTION_AMOUNT": obligation_amt,
+            "STATED_RECORD_TOTAL_AWARD": stated_ceiling,
+            "NON_BINDING_REPORTED_BUDGET": non_binding_amt,
+            "DIRECT_AMOUNT": float(doc.get("TABLE_DIRECT") or 0.0) if included else 0.0,
+            "INDIRECT_AMOUNT": float(doc.get("TABLE_INDIRECT") or 0.0) if included else 0.0,
+            "EXTRACTION_METHOD": doc.get("EXTRACTION_METHOD"),
+            "PDF_PATH": doc.get("PDF_Path")
+        })
+        
+    return transactions
+
+
+def build_award_header(recon_record: dict) -> dict:
+    """Extracts macro-level header metadata from cluster reconciliation records."""
+    return {
+        "AWARD_CLUSTER_KEY": recon_record.get("AWARD_CLUSTER_KEY"),
+        "ORACLE_AWARD_NUMBER": recon_record.get("ORACLE_AWARD_NUMBER"),
+        "CAYUSE_PROJECT_NUMBER": recon_record.get("CAYUSE_PROJECT_NUMBER"),
+        "DOCUMENT_COUNT": recon_record.get("DOCUMENT_COUNT"),
+        "PROJECT_START_DATE": recon_record.get("PDF_START_DATE_TRUTH"),
+        "PROJECT_END_DATE": recon_record.get("PDF_END_DATE_TRUTH"),
+        "TOTAL_AWARDED_AMOUNT": recon_record.get("TOTAL_AWARDED_AMOUNT"),
+        "INITIAL_OBLIGATED_AMOUNT": recon_record.get("INITIAL_OBLIGATED_AMOUNT"),
+        "PDF_CUMULATIVE_OBLIGATED": recon_record.get("PDF_CUMULATIVE_OBLIGATED"),
+        "CAYUSE_CEILING": recon_record.get("CAYUSE_CEILING"),
+        "ORACLE_CEILING": recon_record.get("ORACLE_CEILING")
     }
 
 
@@ -199,7 +291,6 @@ def main():
             for p in fy_dir.rglob("*.pdf"):
                 discovered_pdfs.append((p, "ORACLE"))
 
-    # Apply test cap if enabled
     if TEST_RUN_LIMIT is not None:
         discovered_pdfs = discovered_pdfs[:TEST_RUN_LIMIT]
         print(f"*** TEST MODE ACTIVE: Capped processing to first {len(discovered_pdfs)} files ***")
@@ -216,7 +307,7 @@ def main():
         if idx % 1000 == 0 or idx == len(discovered_pdfs):
             print(f" -> Processed {idx}/{len(discovered_pdfs)} documents...")
 
-    # 3. Dynamic Crosswalk Resolution Pass (Resolves UNKNOWN & Ingests Triage Ledger)
+    # 3. Dynamic Crosswalk Resolution Pass
     build_dynamic_crosswalk(extracted_docs, TRIAGE_EXCEL_PATH)
 
     # 4. Deduplication & Merge
@@ -235,9 +326,18 @@ def main():
         for doc_list in clusters.values()
     ]
 
-    # 7. Exports to SQLite and Excel Audit Workbook
-    export_to_sqlite(merged_docs, reconciliation_results, OUTPUT_SQLITE_PATH)
-    export_audit_workbook(pd.DataFrame(reconciliation_results), pd.DataFrame(merged_docs), OUTPUT_EXCEL_PATH)
+    # 7. Build Header & Transaction Relational Data Structures
+    award_headers = [build_award_header(r) for r in reconciliation_results]
+    transaction_ledger = build_transaction_ledger(merged_docs)
+
+    # 8. Exports to Relational SQLite and Split Excel Audit Workbook
+    export_to_sqlite(award_headers, transaction_ledger, reconciliation_results, OUTPUT_SQLITE_PATH)
+    export_audit_workbook(
+        pd.DataFrame(reconciliation_results), 
+        pd.DataFrame(award_headers), 
+        pd.DataFrame(transaction_ledger), 
+        OUTPUT_EXCEL_PATH
+    )
 
     print("\nPipeline Execution Complete!")
     print(f"-> SQLite Staged Database: {OUTPUT_SQLITE_PATH}")
