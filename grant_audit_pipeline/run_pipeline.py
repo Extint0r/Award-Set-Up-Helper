@@ -53,6 +53,7 @@ def build_transaction_ledger(doc_list: list) -> list:
     Evaluates explicit action deltas (Box 20) vs cumulative step-functions (Box 27 - Prior Cumulative)
     to infer non-cash budget authorizations (e.g. Year 2 carryover / re-authorizations).
     Applies Tier 2 Fuzzy Window Deduplication (±14 days execution, ±30 days budget start, ±$1.00) to isolate shadow duplicates.
+    Propagates HITL flags and discrepancy notes from Pass 1 extraction.
     """
     clusters = {}
     for doc in doc_list:
@@ -159,7 +160,14 @@ def build_transaction_ledger(doc_list: list) -> list:
                 "DIRECT_AMOUNT": float(doc.get("TABLE_DIRECT") or 0.0) if included else 0.0,
                 "INDIRECT_AMOUNT": float(doc.get("TABLE_INDIRECT") or 0.0) if included else 0.0,
                 "EXTRACTION_METHOD": doc.get("EXTRACTION_METHOD"),
-                "PDF_PATH": doc.get("PDF_Path")
+                "HITL_REVIEW_REQUIRED": bool(doc.get("HITL_REVIEW_REQUIRED", False)),
+                "DISCREPANCY_NOTE": str(doc.get("DISCREPANCY_NOTE") or ""),
+                "PDF_PATH": doc.get("PDF_Path"),
+                # FIXED: Baseline metrics propagated to downstream ledger and reconciliation
+                "CAYUSE_CEILING": float(doc.get("CAYUSE_CEILING") or 0.0),
+                "CAYUSE_OBLIGATED": float(doc.get("CAYUSE_OBLIGATED") or 0.0),
+                "ORACLE_CEILING": float(doc.get("ORACLE_CEILING") or 0.0),
+                "ORACLE_OBLIGATED": float(doc.get("ORACLE_OBLIGATED") or 0.0)
             })
 
     return transactions
@@ -169,6 +177,7 @@ def aggregate_cluster_reconciliation(cluster_transactions: list) -> dict:
     """
     Aggregates transaction-level ledger records into cluster-level truth 
     for 3-way reconciliation against Cayuse and Oracle baselines.
+    Integrates HITL Audit Flags when dual-source conflicts occur.
     """
     if not cluster_transactions:
         return {}
@@ -230,13 +239,22 @@ def aggregate_cluster_reconciliation(cluster_transactions: list) -> dict:
     pdf_start_date = start_dates.min() if not start_dates.empty else None
     pdf_end_date = end_dates.max() if not end_dates.empty else None
 
+    # HITL Dual-Source Mismatch Check
+    hitl_flag_triggered = any(tx.get("HITL_REVIEW_REQUIRED", False) for tx in cluster_transactions)
+    hitl_notes = [tx.get("DISCREPANCY_NOTE") for tx in cluster_transactions if tx.get("DISCREPANCY_NOTE")]
+
     verdict = "IN_SYNC"
     audit_status = "IN_SYNC"
     discrepancy_reason = ""
     ceiling_breach = False
     budget_expanded = (pdf_obligated > initial_obligated_amount)
 
-    if total_awarded_amount is not None and pdf_obligated > total_awarded_amount:
+    if hitl_flag_triggered:
+        verdict = "FLAG_DUAL_SOURCE_CONFLICT"
+        audit_status = "HITL_HUMAN_REVIEW_REQUIRED"
+        notes_str = "; ".join(hitl_notes) if hitl_notes else "Dual-source discrepancy between AI Reader and Regex extraction."
+        discrepancy_reason = f"HUMAN INTERVENTION REQUIRED: {notes_str}"
+    elif total_awarded_amount is not None and pdf_obligated > total_awarded_amount:
         ceiling_breach = True
         verdict = "FLAG_CEILING_BREACH"
         audit_status = "HUMAN_REVIEW_REQUIRED"
@@ -286,6 +304,7 @@ def aggregate_cluster_reconciliation(cluster_transactions: list) -> dict:
         "ORACLE_CEILING": oracle_ceiling,
         "BUDGET_EXPANDED": budget_expanded,
         "CEILING_BREACH": ceiling_breach,
+        "HITL_REVIEW_REQUIRED": hitl_flag_triggered,
         "AUDIT_STATUS": audit_status,
         "RECONCILIATION_VERDICT": verdict,
         "DISCREPANCY_REASON": discrepancy_reason

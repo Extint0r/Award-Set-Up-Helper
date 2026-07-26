@@ -27,7 +27,12 @@ def export_to_sqlite(
     recon_results: List[Dict[str, Any]], 
     db_path: Path
 ):
-    """Initializes SQLite schema and stages Award Headers, Transaction Ledger, and Reconciliation Summaries."""
+    """
+    STAGE 5: Relational Database Staging & Indexing Engine
+    
+    Initializes SQLite schema, cleans complex objects, writes relational tables,
+    and constructs multi-column indexes for high-speed audit queries across enterprise datasets.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
     header_df = pd.DataFrame(headers)
@@ -39,7 +44,7 @@ def export_to_sqlite(
     tx_df     = sanitize_complex_types_for_sqlite(tx_df)
     recon_df  = sanitize_complex_types_for_sqlite(recon_df)
 
-    # 2. Format dates to string for SQLite compatibility
+    # 2. Format dates & booleans for SQLite compatibility
     date_cols_tx = ["ACTION_DATE", "BUDGET_PERIOD_START", "BUDGET_PERIOD_END"]
     for col in date_cols_tx:
         if col in tx_df.columns:
@@ -51,9 +56,27 @@ def export_to_sqlite(
         if col in header_df.columns:
             header_df[col] = header_df[col].astype(str)
 
+    if "HITL_REVIEW_REQUIRED" in tx_df.columns:
+        tx_df["HITL_REVIEW_REQUIRED"] = tx_df["HITL_REVIEW_REQUIRED"].apply(
+            lambda x: 1 if bool(x) and str(x).lower() not in ("false", "0", "none", "") else 0
+        )
+
+    if "HITL_REVIEW_REQUIRED" in recon_df.columns:
+        recon_df["HITL_REVIEW_REQUIRED"] = recon_df["HITL_REVIEW_REQUIRED"].apply(
+            lambda x: 1 if bool(x) and str(x).lower() not in ("false", "0", "none", "") else 0
+        )
+
     # 3. Write relational tables to SQLite database
     with sqlite3.connect(db_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
         header_df.to_sql("tbl_Award_Header", conn, if_exists="replace", index=False)
         tx_df.to_sql("tbl_Award_Transactions", conn, if_exists="replace", index=False)
         recon_df.to_sql("tbl_Reconciliation_Summary", conn, if_exists="replace", index=False)
+
+        # 4. Build Relational Performance Indexes for Enterprise Audit Queries
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hdr_cluster ON tbl_Award_Header(AWARD_CLUSTER_KEY);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_cluster ON tbl_Award_Transactions(AWARD_CLUSTER_KEY);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_status ON tbl_Award_Transactions(LEDGER_ACTION_STATUS);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_hitl ON tbl_Award_Transactions(HITL_REVIEW_REQUIRED);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recon_cluster ON tbl_Reconciliation_Summary(AWARD_CLUSTER_KEY);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recon_verdict ON tbl_Reconciliation_Summary(RECONCILIATION_VERDICT);")

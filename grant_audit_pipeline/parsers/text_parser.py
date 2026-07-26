@@ -12,11 +12,11 @@ from config import (
     parse_dollar_amount, parse_date, format_master_yaml_header, find_markdown_file
 )
 from parsers.table_finder import extract_budget_from_pdf_tables
-from parsers.vision_parser import parse_budget_table_with_vision
+from parsers.ai_reader import parse_ai_header_payload
 
 # Regex patterns for De-obligation & Administrative Action filtering
 RE_DEOBLIGATION_PATTERNS = re.compile(
-    r'\b(?:de-?obligat(?:ion|ed|e)|funding\s+reduction|reduction\s+of\s+funds|decrease\s+award|net\s+reduction|de-?commit(?:ment)?)\b|'
+    r'(?:^|[-_.\s])(?:de-?obligat(?:ion|ed|e)?|de-?ob|funding[-_\s]+reduction|reduction[-_\s]+of[-_\s]+funds|decrease[-_\s]+award|net[-_\s]+reduction|de-?commit(?:ment)?)(?:$|[-_.\s])|'
     r'\(\s*\$\s*[\d,]+(?:\.\d{2})?\s*\)',
     re.IGNORECASE
 )
@@ -147,7 +147,7 @@ def classify_document_type(filename: str, body_text: str = "") -> Tuple[str, boo
     fn = str(filename)
     header_text = body_text[:3000]
     
-    # 1. Outgoing Subcontracts
+    # 1. Outgoing Subcontracts (Non-binding transfers from institutional perspective)
     if check_subcontract_out(fn, body_text):
         return ("SUBCONTRACT_OUT", False)
         
@@ -172,7 +172,6 @@ def classify_document_type(filename: str, body_text: str = "") -> Tuple[str, boo
         return ("DEOBLIGATION", True)
 
     # 7. Non-Financial Administrative Modifications
-    # Restrict RE_ADMIN_MOD_PATTERNS strictly to filenames to prevent body text false positives
     if RE_ADMIN_MOD_PATTERNS.search(fn):
         return ("ADMINISTRATIVE_MODIFICATION", False)
 
@@ -186,19 +185,14 @@ def classify_document_type(filename: str, body_text: str = "") -> Tuple[str, boo
 
 def detect_sponsor_template(filename: str, body_text: str = "", aln_number: str = "") -> str:
     """
-    SPONSOR CLASSIFIER REGISTRY (REFINED):
+    SPONSOR CLASSIFIER REGISTRY:
     Auto-detects sponsor template taxonomy upfront to route to specific pattern matchers.
-    
-    CRITICAL FIX: Agency-First Priority.
-    Checks ALN numbers and explicit agency markers BEFORE checking subaward fallbacks.
-    Removes 'amd' keyword over-matching (amd = amendment, NOT subaward).
     """
     fn = str(filename).lower()
     text = body_text[:4000].lower() if body_text else ""
 
     # 1. NIH / PHS (ALN 93.xxx or explicit NIH/PHS markers)
     if "nih" in fn or "phs" in text or "national institutes of health" in text or "department of health and human services" in text or aln_number.startswith("93"):
-        # Check if it's a pass-through subaward from another university/institution under NIH
         if any(k in fn for k in ["ucsf", "bcm", "uthsc", "uc-sf", "subaward_in"]):
             return "SUBCONTRACT_IN"
         return "NIH_PHS"
@@ -240,7 +234,7 @@ def extract_sponsor_feature_vector(
     table_total: float = 0.0
 ) -> Dict[str, float]:
     """
-    STAGE 3: SPONSOR-SPECIFIC FEATURE VECTOR EXTRACTION
+    STAGE 3: SPONSOR-SPECIFIC FEATURE VECTOR EXTRACTION (REGEX BACKUP)
     Extracts up to 4 financial anchors into a normalized vector:
     [ACTION_AMOUNT, PERIOD_AMOUNT, CUMULATIVE_AMOUNT, PROJECT_CEILING]
     """
@@ -252,30 +246,25 @@ def extract_sponsor_feature_vector(
     m_ceiling = 0.0
 
     if template_type == "NIH_PHS":
-        # Box 20: Action Obligation
         m_20 = re.search(r'(?:20\.\s*Total\s*Amount\s*of\s*Federal\s*Funds\s*Obligated\s*by\s*this\s*Action|Obligated\s*by\s*this\s*Action)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
         if m_20:
             a_action = parse_dollar_amount(m_20.group(1))
 
-        # Box 23: Budget Period Obligation
         m_23 = re.search(r'(?:23\.\s*Total\s*Amount\s*of\s*Federal\s*Funds\s*Obligated\s*this\s*budget\s*period|Obligated\s*this\s*budget\s*period)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
         if m_23:
             b_period = parse_dollar_amount(m_23.group(1))
 
-        # Box 27: Stated Cumulative Award Total to Date
         m_27 = re.search(r'(?:27\.\s*Total\s*Amount\s*of\s*the\s*Federal\s*Award|including\s*Approved\s*Cost\s*Sharing\s*this\s*Project\s*Period)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
         if m_27:
             c_cum = parse_dollar_amount(m_27.group(1))
 
     elif template_type == "SUBCONTRACT_IN":
-        # Enhanced Subaward re-anchoring: Prioritize Subrecipient Direct + Indirect Local Allocation
         a_action = (table_direct + table_indirect) if (table_direct + table_indirect) > 0 else table_direct
         if a_action == 0.0:
             m_sub_tot = re.search(r'(?:Subaward\s*Total|Total\s*Subaward\s*Amount|Amount\s*Funded|Direct\s*Costs?)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
             if m_sub_tot:
                 a_action = parse_dollar_amount(m_sub_tot.group(1))
 
-        # Capture prime grant total as ceiling reference
         m_prime = re.search(r'(?:Prime\s*Award|Grant\ Total|Total\ Federal\ Award|Total\ Estimated\ Cost)\s*[:\=]?\s*\$?\s*([\d,]+(?:\.\d{2})?)', text, re.IGNORECASE)
         if m_prime:
             m_ceiling = parse_dollar_amount(m_prime.group(1))
@@ -343,7 +332,7 @@ def process_document_pass_1(
     raw_md_text = ""
     md_path = find_markdown_file(pdf_path, md_dir)
 
-    # 1. Identifier Extraction
+    # 1. Identifier Extraction (Filename & Raw Text Base)
     cay_proj_matches = RE_CAYUSE_PROJ.findall(filename)
     cay_prop_matches = RE_CAYUSE_PROP.findall(filename)
     oracle_matches   = RE_ORACLE_NUM.findall(filename)
@@ -362,7 +351,7 @@ def process_document_pass_1(
 
     cayuse_yy = extract_cayuse_year(raw_cay_proj, filename)
 
-    # 2. Text Extraction & Page Inspection
+    # 2. Text Body Extraction
     budget_pages: List[int] = []
     if md_path and md_path.exists():
         with open(md_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -396,97 +385,127 @@ def process_document_pass_1(
         if cfda_txt:
             aln_number = cfda_txt.group(1)
 
-    # 3. STAGE 2 IMMUTABLE Classification & Sponsor Auto-Detection
-    action_category, is_binding_financial_action = classify_document_type(filename, body_text)
-    sponsor_template = detect_sponsor_template(filename, body_text, aln_number)
+    # 3. SECONDARY VERIFICATION PASS: PyMuPDF / Regex Classification & Extraction
+    regex_category, regex_is_binding = classify_document_type(filename, body_text)
+    regex_template = detect_sponsor_template(filename, body_text, aln_number)
 
-    # 4. Header Financial & Date Extraction
-    header_scope = body_text[:4000] if body_text else ""
-    
-    exec_match = RE_EXECUTION_DATE.search(header_scope)
-    execution_date = parse_date(exec_match.group(1)) if exec_match else None
-    
-    range_match = RE_DATE_RANGE.search(header_scope)
-    doc_start_date = parse_date(range_match.group(1)) if range_match else None
-    doc_end_date = parse_date(range_match.group(2)) if range_match else None
-
-    if not doc_start_date and snippet_dates['start_date']:
-        doc_start_date = parse_date(snippet_dates['start_date'])
-    if not doc_end_date and snippet_dates['end_date']:
-        doc_end_date = parse_date(snippet_dates['end_date'])
-    if not execution_date and snippet_dates['exec_date']:
-        execution_date = parse_date(snippet_dates['exec_date'])
-
-    # 5. Budget Table Parsing
     table_total, table_indirect, table_direct = 0.0, 0.0, 0.0
-    has_budget_table = len(budget_pages) > 0 or (bool(body_text) and any(kw in body_text.lower() for kw in BUDGET_PAGE_KEYWORDS))
-    if has_budget_table and not budget_pages:
-        budget_pages = [1]
+    tot_match = RE_BUDGET_TOTAL.search(body_text)
+    ind_match = RE_INDIRECT_COST.search(body_text)
+    if tot_match:
+        table_total = parse_dollar_amount(tot_match.group(1))
+    if ind_match:
+        table_indirect = parse_dollar_amount(ind_match.group(1))
 
-    budget_split_status = "NO_BUDGET_TABLE"
-    extraction_method = "PyMuPDF_Fast"
+    if table_total == 0.0:
+        tb_direct, tb_indirect, tb_total = extract_budget_from_pdf_tables(pdf_path)
+        if tb_total > 0:
+            table_direct, table_indirect, table_total = tb_direct, tb_indirect, tb_total
 
-    v_exec_date, v_budget_start, v_budget_end, v_proj_start, v_proj_end = None, None, None, None, None
-
-    if has_budget_table and is_binding_financial_action:
-        tot_match = RE_BUDGET_TOTAL.search(body_text)
-        ind_match = RE_INDIRECT_COST.search(body_text)
-        if tot_match:
-            table_total = parse_dollar_amount(tot_match.group(1))
-        if ind_match:
-            table_indirect = parse_dollar_amount(ind_match.group(1))
-
-        if table_total == 0.0:
-            tb_direct, tb_indirect, tb_total = extract_budget_from_pdf_tables(pdf_path)
-            if tb_total > 0:
-                table_direct, table_indirect, table_total = tb_direct, tb_indirect, tb_total
-
-        if ENABLE_VISION_FALLBACK and budget_pages:
-            target_vision_page = 1 if (1 in budget_pages or not budget_pages) else budget_pages[0]
-            v_res = parse_budget_table_with_vision(pdf_path, target_vision_page)
-            if v_res.get("VISION_EVAL_STATUS") == "PASSED" and v_res.get("VISION_PARSED_TOTAL", 0.0) > 0:
-                if table_total == 0.0 or v_res.get("VISION_CONFIDENCE_SCORE", 0.0) >= 0.8:
-                    table_direct = v_res["VISION_PARSED_DIRECT"]
-                    table_indirect = v_res["VISION_PARSED_INDIRECT"]
-                    table_total = v_res["VISION_PARSED_TOTAL"]
-                    v_exec_date = v_res.get("VISION_EXECUTION_DATE")
-                    v_budget_start = v_res.get("VISION_BUDGET_START")
-                    v_budget_end = v_res.get("VISION_BUDGET_END")
-                    v_proj_start = v_res.get("VISION_PROJECT_START")
-                    v_proj_end = v_res.get("VISION_PROJECT_END")
-                    extraction_method = "Multimodal_Vision_AI"
-
-        if table_total > 0 and table_direct == 0.0:
-            table_direct = max(0.0, table_total - table_indirect)
-
-    # 6. STAGE 3 FEATURE VECTOR EXTRACTION
-    feature_vector = extract_sponsor_feature_vector(
-        body_text, sponsor_template, table_direct, table_indirect, table_total
+    regex_fv = extract_sponsor_feature_vector(
+        body_text, regex_template, table_direct, table_indirect, table_total
     )
+    regex_action = regex_fv.get("ACTION_AMOUNT", 0.0)
 
+    # 4. PRIMARY PASS: Multimodal AI Reader (4-Page Ingestion & Local Cache)
+    ai_payload = parse_ai_header_payload(pdf_path, max_pages=4)
+
+    extraction_method = "Multimodal_AI_Reader"
+    hitl_review_required = False
+    discrepancy_note = ""
+
+    if ai_payload and ai_payload.get("EVAL_STATUS") in ("PASSED", "PASSED_CACHE_HIT"):
+        ai_meta = ai_payload.get("DOCUMENT_METADATA") or {}
+        ai_dates = ai_payload.get("DATES") or {}
+        ai_fin = ai_payload.get("FINANCIAL_VECTOR") or {}
+        ai_conf = ai_payload.get("CONFIDENCE_SCORE", 0.95)
+
+        # Primary Assignments from AI JSON
+        sponsor_template = ai_meta.get("detected_sponsor_template") or regex_template
+        is_official = bool(ai_meta.get("is_official_sponsor_notice", True))
+        is_admin = bool(ai_meta.get("is_administrative_non_financial_action", False))
+
+        if is_admin:
+            action_category = "ADMINISTRATIVE_MODIFICATION"
+            is_binding_financial_action = False
+        elif not is_official:
+            action_category = regex_category if regex_category != "OFFICIAL_NOA" else "TECHNICAL_NARRATIVE"
+            is_binding_financial_action = False
+        else:
+            action_category = regex_category if regex_category not in ("OFFICIAL_NOA", "ADMINISTRATIVE_MODIFICATION") else "OFFICIAL_NOA"
+            is_binding_financial_action = True
+
+        execution_date = parse_date(ai_dates.get("execution_date")) or parse_date(snippet_dates['exec_date'])
+        doc_start_date = parse_date(ai_dates.get("budget_period_start")) or parse_date(snippet_dates['start_date'])
+        doc_end_date   = parse_date(ai_dates.get("budget_period_end")) or parse_date(snippet_dates['end_date'])
+
+        a_action = parse_dollar_amount(ai_fin.get("action_obligation_amount"))
+        b_period = parse_dollar_amount(ai_fin.get("current_budget_period_total"))
+        c_cum    = parse_dollar_amount(ai_fin.get("cumulative_obligated_to_date"))
+        m_ceil   = parse_dollar_amount(ai_fin.get("total_project_ceiling"))
+        sub_dir  = parse_dollar_amount(ai_fin.get("local_subrecipient_direct_cost"))
+        sub_ind  = parse_dollar_amount(ai_fin.get("local_subrecipient_indirect_cost"))
+
+        # Subaward Pass-Through Re-anchoring
+        if sponsor_template == "SUBCONTRACT_IN" and (sub_dir + sub_ind) > 0:
+            a_action = sub_dir + sub_ind
+            table_direct, table_indirect = sub_dir, sub_ind
+
+        feature_vector = {
+            "ACTION_AMOUNT": a_action,
+            "PERIOD_AMOUNT": b_period,
+            "CUMULATIVE_AMOUNT": c_cum,
+            "PROJECT_CEILING": m_ceil
+        }
+
+        # Dual-Source Delta Discrepancy & HITL Resolution Check
+        delta_diff = abs(a_action - regex_action)
+        if a_action > 0 and regex_action > 0 and delta_diff > 1000.0 and ai_conf < 0.80:
+            hitl_review_required = True
+            discrepancy_note = f"HITL_REVIEW_REQUIRED: Dual-Source Delta Discrepancy (AI=${a_action:,.2f} vs Regex=${regex_action:,.2f})"
+
+    else:
+        # Fallback to PyMuPDF / Regex if AI Reader is unconfigured or failed
+        extraction_method = "PyMuPDF_Regex_Fallback"
+        sponsor_template = regex_template
+        action_category = regex_category
+        is_binding_financial_action = regex_is_binding
+        feature_vector = regex_fv
+        execution_date = parse_date(snippet_dates['exec_date'])
+        doc_start_date = parse_date(snippet_dates['start_date'])
+        doc_end_date   = parse_date(snippet_dates['end_date'])
+
+    # 5. MULTI-SIGNAL CATEGORY VALIDATION CONTRACTS
     extracted_delta = feature_vector["ACTION_AMOUNT"]
-    doc_ceiling = feature_vector["PROJECT_CEILING"]
+    doc_ceiling     = feature_vector["PROJECT_CEILING"]
 
-    # GUARDRAIL 1: Subaward Prime Federal Grant Ceiling Isolation
-    if sponsor_template == "SUBCONTRACT_IN":
-        if extracted_delta > 1000000 and 0 < table_direct < 500000:
-            extracted_delta = table_direct + table_indirect if (table_direct + table_indirect) > 0 else table_direct
-            budget_split_status = "REANCHORED_SUBAWARD_TOTAL"
+    # CONTRACT RULE 1: Admin Mod / NCE Re-Classification Override
+    if action_category in ("ADMINISTRATIVE_MODIFICATION", "NO_COST_EXTENSION") and extracted_delta > 0.0:
+        action_category = "OFFICIAL_NOA"
+        is_binding_financial_action = True
+        budget_split_status = "UPGRADED_FROM_ADMIN_MOD_TO_NOA"
+    else:
+        budget_split_status = "NORMAL_PARSED"
 
-    # GUARDRAIL 2: De-obligation Negative Delta Normalization
+    # CONTRACT RULE 2: De-obligation Negative Delta Normalization
     if action_category == "DEOBLIGATION":
+        is_binding_financial_action = True
         if extracted_delta > 0.0:
             extracted_delta = -abs(extracted_delta)
+            feature_vector["ACTION_AMOUNT"] = extracted_delta
         budget_split_status = "ENFORCED_DEOBLIGATION_NEGATIVE"
 
-    # GUARDRAIL 3: Strict NCE Non-Financial Enforcement (IMMUTABLE)
+    # CONTRACT RULE 3: Strict Outgoing Subcontracts Isolation (Non-Binding Transfers)
+    if action_category == "SUBCONTRACT_OUT":
+        is_binding_financial_action = False
+        budget_split_status = "SUBCONTRACT_OUT_NON_BINDING"
+
+    # CONTRACT RULE 4: Strict NCE Non-Financial Enforcement & Binding Column Segregation
     if action_category == "NO_COST_EXTENSION":
         non_binding_reported_budget = extracted_delta or feature_vector["CUMULATIVE_AMOUNT"] or table_total
         delta_obligated = 0.00
         doc_ceiling = 0.00
         budget_split_status = "NCE_NON_FINANCIAL_RESTATED_BUDGET"
-
-    # GUARDRAIL 4: Column Segregation based on Binding Status
     elif is_binding_financial_action:
         delta_obligated = extracted_delta
         non_binding_reported_budget = 0.00
@@ -515,14 +534,15 @@ def process_document_pass_1(
         "delta_obligated": delta_obligated,
         "doc_ceiling": doc_ceiling,
         "non_binding_reported_budget": non_binding_reported_budget,
-        "has_budget_table": has_budget_table,
+        "has_budget_table": len(budget_pages) > 0,
         "budget_pages": budget_pages,
         "budget_split_status": budget_split_status,
         "table_total": table_total,
         "table_direct": table_direct,
         "table_indirect": table_indirect,
         "extraction_method": extraction_method,
-        "date_snippets": date_snippets
+        "hitl_review_required": hitl_review_required,
+        "discrepancy_note": discrepancy_note
     }
 
     if not (md_path and md_path.exists()):
@@ -555,20 +575,16 @@ def process_document_pass_1(
         "DOC_CEILING": doc_ceiling,
         "NON_BINDING_REPORTED_BUDGET": non_binding_reported_budget,
         "FEATURE_VECTOR": feature_vector,
-        "HAS_BUDGET_TABLE": has_budget_table,
+        "HAS_BUDGET_TABLE": len(budget_pages) > 0,
         "TABLE_TOTAL": table_total,
         "TABLE_DIRECT": table_direct,
         "TABLE_INDIRECT": table_indirect,
         "BUDGET_SPLIT_STATUS": budget_split_status,
         "EXTRACTION_METHOD": extraction_method,
+        "HITL_REVIEW_REQUIRED": hitl_review_required,
+        "DISCREPANCY_NOTE": discrepancy_note,
         "LEAD_PI": lead_pi,
         "ALN_NUMBER": aln_number,
         "TEXT_BODY": body_text,
-        "BUDGET_PAGES": budget_pages,
-        "DATE_SNIPPETS": date_snippets,
-        "VISION_EXECUTION_DATE": v_exec_date,
-        "VISION_BUDGET_START": v_budget_start,
-        "VISION_BUDGET_END": v_budget_end,
-        "VISION_PROJECT_START": v_proj_start,
-        "VISION_PROJECT_END": v_proj_end
+        "BUDGET_PAGES": budget_pages
     }
