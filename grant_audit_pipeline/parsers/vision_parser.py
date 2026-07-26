@@ -46,9 +46,9 @@ def parse_budget_table_with_vision(
     api_key: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Targeted Multimodal Vision Parser using Gemini Flash via the new google-genai SDK.
-    Explicitly handles NIH Notice of Award boxes (Box 20, 20a, 20b, 27) and generic award tables.
-    Includes instant local disk caching and socket timeout safeguards.
+    FIX 3.1: Targeted Multimodal Vision Parser using Gemini Flash via google-genai SDK.
+    Explicitly handles NIH Notice of Award boxes (Box 20, 20a, 20b, 27), NSF, DOE, DOD, 
+    and Subaward face page tables with a sponsor-agnostic JSON extraction schema.
     """
     fallback_result = {
         "EXTRACTION_METHOD": "Fallback_Rules",
@@ -94,25 +94,25 @@ def parse_budget_table_with_vision(
             # 3. Initialize modern GenAI client
             client = genai.Client(api_key=effective_key)
 
-            # 4. Prompt specifically tailored for NIH Notice of Award headers & standard budget tables
+            # 4. Sponsor-Agnostic Prompt tailored for NIH, NSF, DOE, DOD, and Subawards
             prompt = """
         You are an expert research administration auditor inspecting an award document page image.
 
         1. DATE CLASSIFICATION (Look at header text, Section I, or signature blocks):
-           - execution_date: The official issue date or sponsor signature date for THIS action (e.g., "Award Date", "Issue Date").
-           - budget_period_start: Start date for THIS active budget period (e.g., NIH Box 19 Start Date).
-           - budget_period_end: End date for THIS active budget period (e.g., NIH Box 19 End Date).
+           - execution_date: Official issue/award date for THIS action (e.g., "Award Date", "Issue Date", "Notice Date").
+           - budget_period_start: Start date for THIS active budget period (e.g., NIH Box 19, Current Budget Period Start).
+           - budget_period_end: End date for THIS active budget period (e.g., NIH Box 19, Current Budget Period End).
            - project_period_start: Overall cumulative project start date (e.g., NIH Box 26 Start Date).
            - project_period_end: Overall cumulative project max end date (e.g., NIH Box 26 End Date).
 
         2. FINANCIAL BREAKDOWN FOR THIS SPECIFIC ACTION:
-           - direct_cost: Direct costs for THIS action (numeric float or null).
-           - indirect_cost: Indirect / F&A costs for THIS action (numeric float or null).
-           - total_action_amount: Total obligated by THIS action (numeric float or null, e.g., NIH Box 20).
+           - direct_cost: Direct costs allocated for THIS action (numeric float or null).
+           - indirect_cost: Indirect / F&A costs allocated for THIS action (numeric float or null).
+           - total_action_amount: Incremental funds obligated by THIS action (numeric float or null, e.g., NIH Box 20, Amount Funded This Action).
 
         3. CUMULATIVE AWARD / PROJECT CEILING:
-           - cumulative_award_to_date: Total running federal funds obligated to date (numeric float or null, e.g., NIH Box 27).
-           - total_project_ceiling: Total anticipated multi-year project ceiling if listed.
+           - cumulative_award_to_date: Total running federal/sponsor funds obligated to date (numeric float or null, e.g., NIH Box 27, Total Obligated Funds).
+           - total_project_ceiling: Total anticipated multi-year project ceiling or estimated total award amount.
 
         Respond STRICTLY with JSON matching this structure:
         {

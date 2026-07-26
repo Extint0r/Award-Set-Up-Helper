@@ -35,7 +35,7 @@ def export_audit_workbook(
     Exports audit results into 3 relational sheets with professional openpyxl formatting:
     1. 3Way_Reconciliation: Executive Compliance Verdicts & Audit Flags
     2. Award_Headers: Macro Award Metadata & Multi-Year Ceilings
-    3. Transaction_Ledger: Itemized Actions with Currency, Date, and Conditional Formatting
+    3. Transaction_Ledger: Itemized Actions with Currency, Date, Inferred Action Highlights, and Status Formatting
     """
     excel_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -65,17 +65,20 @@ def export_audit_workbook(
     wb = openpyxl.load_workbook(excel_path)
     
     # Define Fills and Fonts for Status Highlighting
-    fill_green  = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid") # Soft Green
-    font_green  = Font(color="375623", bold=True)
+    fill_green   = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid") # Soft Green
+    font_green   = Font(color="375623", bold=True)
     
-    fill_red    = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid") # Soft Red/Orange
-    font_red    = Font(color="C65911", bold=True)
-    
-    fill_gray   = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid") # Soft Gray
-    font_gray   = Font(color="595959", italic=True)
+    fill_blue    = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid") # Soft Blue (Inferred Actions)
+    font_blue    = Font(color="1F4E78", bold=True)
 
-    fill_yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid") # Soft Yellow
-    font_yellow = Font(color="7F6000")
+    fill_red     = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid") # Soft Red/Orange
+    font_red     = Font(color="C65911", bold=True)
+    
+    fill_gray    = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid") # Soft Gray
+    font_gray    = Font(color="595959", italic=True)
+
+    fill_yellow  = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid") # Soft Yellow
+    font_yellow  = Font(color="7F6000")
 
     sheet_tables = [
         ("3Way_Reconciliation", "Table_3Way_Reconciliation"),
@@ -98,6 +101,12 @@ def export_audit_workbook(
         path_cols = ["PDF_PATH", "PDF_Path", "Markdown_Path"]
 
         for row in range(2, ws.max_row + 1):
+            # Check if this row is an inferred action on Transaction_Ledger
+            is_inferred_row = False
+            if sheet_name == "Transaction_Ledger" and "IS_INFERRED_ACTION" in headers:
+                inf_col_idx = headers.index("IS_INFERRED_ACTION") + 1
+                is_inferred_row = bool(ws.cell(row=row, column=inf_col_idx).value)
+
             for col_idx, h in enumerate(headers, 1):
                 cell = ws.cell(row=row, column=col_idx)
                 val_str = str(cell.value) if cell.value is not None else ""
@@ -128,8 +137,12 @@ def export_audit_workbook(
 
                 if h_str == "LEDGER_ACTION_STATUS":
                     if cell.value == "PRIMARY_ACTIVE_ACTION":
-                        cell.fill = fill_green
-                        cell.font = font_green
+                        if is_inferred_row:
+                            cell.fill = fill_blue
+                            cell.font = font_blue
+                        else:
+                            cell.fill = fill_green
+                            cell.font = font_green
                     elif cell.value == "DUPLICATE_SHADOW_RECORD":
                         cell.fill = fill_gray
                         cell.font = font_gray

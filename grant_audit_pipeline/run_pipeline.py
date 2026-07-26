@@ -17,14 +17,42 @@ from exporters.db_exporter import export_to_sqlite
 from exporters.excel_exporter import export_audit_workbook
 
 
+def is_fuzzy_duplicate(delta_candidate: float, b_start, exec_dt, seen_actions: list) -> bool:
+    """
+    Tier 2 Fuzzy Window Deduplication Check.
+    Requires execution dates within 14 days AND budget start dates within 30 days (if both present).
+    Prevents same-amount actions in different budget years from falsely matching as duplicates when NaT occurs.
+    """
+    for seen in seen_actions:
+        amt_match = abs(delta_candidate - seen['amount']) <= 1.0
+        if not amt_match:
+            continue
+
+        seen_b = seen['budget_start']
+        seen_e = seen['exec_date']
+
+        # 1. Execution date check: Must be within 14 days
+        e_diff_days = abs((pd.to_datetime(exec_dt) - pd.to_datetime(seen_e)).days) if (pd.notna(exec_dt) and pd.notna(seen_e)) else 0
+        if e_diff_days > 14:
+            continue
+
+        # 2. Budget start date check: If both present, must be within 30 days
+        if pd.notna(b_start) and pd.notna(seen_b):
+            b_diff_days = abs((pd.to_datetime(b_start) - pd.to_datetime(seen_b)).days)
+            if b_diff_days > 30:
+                continue
+
+        return True
+
+    return False
+
+
 def build_transaction_ledger(doc_list: list) -> list:
     """
-    STAGE 4: Cluster Reducer & Functional Deduplication Ledger Engine
-    
-    Transforms extracted documents into a clean relational transaction ledger.
-    Applies Tier 2 Fuzzy Window Deduplication (±14 days, ±$1.00) strictly per AWARD_CLUSTER_KEY
-    to catch structural near-duplicates (appended signature pages, unparsed shadow copies)
-    without mutating underlying document categories.
+    STAGE 4: SPONSOR-AGNOSTIC DELTA SOLVER & CLUSTER LEDGER ENGINE
+    Evaluates explicit action deltas (Box 20) vs cumulative step-functions (Box 27 - Prior Cumulative)
+    to infer non-cash budget authorizations (e.g. Year 2 carryover / re-authorizations).
+    Applies Tier 2 Fuzzy Window Deduplication (±14 days execution, ±30 days budget start, ±$1.00) to isolate shadow duplicates.
     """
     clusters = {}
     for doc in doc_list:
@@ -34,68 +62,81 @@ def build_transaction_ledger(doc_list: list) -> list:
     transactions = []
 
     for ckey, docs in clusters.items():
-        # List of seen active binding actions for this cluster
+        # Sort cluster documents chronologically
+        docs_sorted = sorted(
+            docs,
+            key=lambda d: pd.to_datetime(
+                d.get("EXECUTION_DATE") or d.get("DOC_START_DATE") or "1970-01-01",
+                errors='coerce'
+            )
+        )
+
+        cluster_running_cum_obligated = 0.0
         seen_binding_actions = []
 
-        for doc in docs:
+        for doc in docs_sorted:
             filename = str(doc.get("Filename") or doc.get("FILENAME") or "")
             action_cat = str(doc.get("ACTION_CATEGORY", "OFFICIAL_NOA"))
             is_binding = bool(doc.get("IS_BINDING_FINANCIAL_ACTION", True))
+            sponsor_tmpl = str(doc.get("SPONSOR_TEMPLATE", "GENERIC_NOA"))
 
-            raw_delta = float(doc.get("DELTA_OBLIGATED") or doc.get("OBLIGATION_ACTION_AMOUNT") or 0.0)
-            raw_ceiling = float(doc.get("DOC_CEILING") or doc.get("STATED_RECORD_TOTAL_AWARD") or 0.0)
+            fv = doc.get("FEATURE_VECTOR") or {}
+            a_action = float(fv.get("ACTION_AMOUNT") or doc.get("DELTA_OBLIGATED") or 0.0)
+            c_cum_doc = float(fv.get("CUMULATIVE_AMOUNT") or 0.0)
+            m_ceiling = float(fv.get("PROJECT_CEILING") or doc.get("DOC_CEILING") or 0.0)
             raw_non_binding = float(doc.get("NON_BINDING_REPORTED_BUDGET") or 0.0)
 
             b_start = pd.to_datetime(
-                doc.get("VISION_BUDGET_START") or doc.get("DOC_START_DATE") or doc.get("BUDGET_PERIOD_START"),
+                doc.get("VISION_BUDGET_START") or doc.get("DOC_START_DATE"),
                 format='mixed', errors='coerce'
             )
             exec_dt = pd.to_datetime(
-                doc.get("VISION_EXECUTION_DATE") or doc.get("EXECUTION_DATE") or doc.get("ACTION_DATE"),
+                doc.get("VISION_EXECUTION_DATE") or doc.get("EXECUTION_DATE"),
                 format='mixed', errors='coerce'
             )
 
-            is_dup = False
-            if is_binding and abs(raw_delta) > 0:
-                for seen in seen_binding_actions:
-                    amt_match = abs(raw_delta - seen['amount']) <= 1.0
-                    if amt_match:
-                        seen_b = seen['budget_start']
-                        seen_e = seen['exec_date']
+            # 1. Delta Solver Engine: Direct vs Inferred Delta Resolution (3-Point Triangulation)
+            delta_candidate = 0.0
+            is_inferred = False
 
-                        # Check 1: Budget start dates match or fall within 14-day window
-                        b_match = (pd.isna(b_start) or pd.isna(seen_b)) or (abs((b_start - seen_b).days) <= 14)
-                        # Check 2: Execution dates match or fall within 14-day window
-                        e_match = (pd.isna(exec_dt) or pd.isna(seen_e)) or (abs((exec_dt - seen_e).days) <= 14)
+            if is_binding:
+                if a_action > 0:
+                    delta_candidate = a_action
+                elif a_action == 0.0 and c_cum_doc > 0.0 and c_cum_doc > cluster_running_cum_obligated:
+                    delta_candidate = c_cum_doc - cluster_running_cum_obligated
+                    is_inferred = True
 
-                        if b_match and e_match:
-                            is_dup = True
-                            break
+            # 2. Tier 2 Fuzzy Window Deduplication Check
+            is_dup = is_fuzzy_duplicate(delta_candidate, b_start, exec_dt, seen_binding_actions) if (is_binding and delta_candidate > 0) else False
 
-            if is_binding and abs(raw_delta) > 0 and is_dup:
+            # 3. Status Assignment & Running Cumulative State Update
+            if is_binding and delta_candidate > 0 and is_dup:
                 status = "DUPLICATE_SHADOW_RECORD"
                 included = False
                 obligation_amt = 0.00
                 stated_ceiling = 0.00
-                non_binding_amt = raw_delta
-            elif is_binding:
+                non_binding_amt = delta_candidate
+            elif is_binding and delta_candidate > 0:
                 status = "PRIMARY_ACTIVE_ACTION"
                 included = True
-                obligation_amt = raw_delta
-                stated_ceiling = raw_ceiling
+                obligation_amt = delta_candidate
+                stated_ceiling = m_ceiling
                 non_binding_amt = 0.00
-                if abs(raw_delta) > 0:
-                    seen_binding_actions.append({
-                        'budget_start': b_start,
-                        'exec_date': exec_dt,
-                        'amount': raw_delta
-                    })
+                if is_inferred:
+                    action_cat = "OFFICIAL_NOA"
+
+                cluster_running_cum_obligated += delta_candidate
+                seen_binding_actions.append({
+                    'budget_start': b_start,
+                    'exec_date': exec_dt,
+                    'amount': delta_candidate
+                })
             else:
                 status = "NON_BINDING_RECORD"
                 included = False
                 obligation_amt = 0.00
                 stated_ceiling = 0.00
-                non_binding_amt = raw_delta or raw_non_binding or float(doc.get("TABLE_TOTAL") or 0.0)
+                non_binding_amt = delta_candidate or raw_non_binding or float(doc.get("TABLE_TOTAL") or 0.0)
 
             transactions.append({
                 "TRANSACTION_ID": doc.get("FILE_HASH") or doc.get("Filename"),
@@ -103,8 +144,10 @@ def build_transaction_ledger(doc_list: list) -> list:
                 "ORACLE_AWARD_NUMBER": doc.get("ORACLE_AWARD_NUMBER"),
                 "CAYUSE_PROJECT_NUMBER": doc.get("CAYUSE_PROJECT_NUMBER"),
                 "FILENAME": filename,
+                "SPONSOR_TEMPLATE": sponsor_tmpl,
                 "ACTION_CATEGORY": action_cat,
                 "IS_BINDING_FINANCIAL_ACTION": is_binding,
+                "IS_INFERRED_ACTION": is_inferred,
                 "LEDGER_ACTION_STATUS": status,
                 "INCLUDED_IN_CUMULATIVE_TOTAL": included,
                 "ACTION_DATE": doc.get("EXECUTION_DATE") or doc.get("VISION_EXECUTION_DATE"),
@@ -113,8 +156,8 @@ def build_transaction_ledger(doc_list: list) -> list:
                 "OBLIGATION_ACTION_AMOUNT": obligation_amt,
                 "STATED_RECORD_TOTAL_AWARD": stated_ceiling,
                 "NON_BINDING_REPORTED_BUDGET": non_binding_amt,
-                "DIRECT_AMOUNT": float(doc.get("TABLE_DIRECT") or doc.get("DIRECT_AMOUNT") or 0.0) if included else 0.0,
-                "INDIRECT_AMOUNT": float(doc.get("TABLE_INDIRECT") or doc.get("INDIRECT_AMOUNT") or 0.0) if included else 0.0,
+                "DIRECT_AMOUNT": float(doc.get("TABLE_DIRECT") or 0.0) if included else 0.0,
+                "INDIRECT_AMOUNT": float(doc.get("TABLE_INDIRECT") or 0.0) if included else 0.0,
                 "EXTRACTION_METHOD": doc.get("EXTRACTION_METHOD"),
                 "PDF_PATH": doc.get("PDF_Path")
             })
@@ -173,12 +216,8 @@ def aggregate_cluster_reconciliation(cluster_transactions: list) -> dict:
     declared_ceilings = df_docs[df_docs['STATED_RECORD_TOTAL_AWARD'] > 0]['STATED_RECORD_TOTAL_AWARD'].dropna()
     max_stated_noa_ceiling = float(declared_ceilings.max()) if not declared_ceilings.empty else 0.0
 
-    if max_stated_noa_ceiling > 0 and (cayuse_ceiling == 0 or max_stated_noa_ceiling >= cayuse_ceiling):
-        total_awarded_amount = max_stated_noa_ceiling
-    elif cayuse_ceiling > 0:
-        total_awarded_amount = cayuse_ceiling
-    else:
-        total_awarded_amount = None
+    # Active ceiling calculation considering multi-year budget expansions
+    total_awarded_amount = max(cayuse_ceiling, oracle_ceiling, max_stated_noa_ceiling) if (cayuse_ceiling or oracle_ceiling or max_stated_noa_ceiling) else None
 
     if total_awarded_amount is not None:
         pdf_active_ceiling = max(total_awarded_amount, pdf_obligated)
@@ -271,7 +310,7 @@ def build_award_header(recon_record: dict) -> dict:
 
 
 def main():
-    print("=== STARTING REFACTORED 5-STAGE RECONCILIATION PIPELINE ===")
+    print("=== STARTING SPONSOR-AGNOSTIC REFACTORED PIPELINE ===")
     
     # 1. Discover PDFs across OSP & Oracle FY Folders
     discovered_pdfs = []
@@ -294,7 +333,7 @@ def main():
     unique_pdfs, binary_duplicate_map = stage0_binary_preflight(discovered_pdfs)
     print(f"Stage 0 Pre-Flight complete: {len(unique_pdfs)} unique binary files ({len(discovered_pdfs) - len(unique_pdfs)} exact duplicates bypassed).")
 
-    # STAGE 1 & 2 & 3: Pass 1 Ingestion & Immutable Extraction
+    # STAGE 1 & 2 & 3: Pass 1 Ingestion & Immutable Feature Vector Extraction
     extracted_unique_docs = []
     for idx, (pdf_path, source_tag) in enumerate(unique_pdfs, 1):
         doc_data = process_document_pass_1(pdf_path, source_tag, MD_OUTPUT_DIR)
@@ -308,7 +347,7 @@ def main():
     # Dynamic Crosswalk Resolution Pass (Attaches AWARD_CLUSTER_KEY)
     build_dynamic_crosswalk(all_extracted_docs, TRIAGE_EXCEL_PATH)
 
-    # STAGE 4: Cluster Reducer & Transaction Ledger Engine
+    # STAGE 4: Delta Solver & Cluster Reducer Transaction Ledger
     transaction_ledger = build_transaction_ledger(all_extracted_docs)
     print(f"Stage 4 Cluster Reduction complete: {len(transaction_ledger)} transactions processed.")
 
