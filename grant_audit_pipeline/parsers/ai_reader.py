@@ -48,36 +48,63 @@ def render_pdf_pages_to_images(pdf_path: Path, max_pages: int = 4, target_dpi: i
     return rendered_image_paths
 
 
-def sanitize_ai_identifiers(idents: dict) -> dict:
+def sanitize_ai_identifiers(idents: dict, filename: str = "", body_text: str = "") -> dict:
     """
-    Post-processing defense-in-depth sanitization:
-    - Oracle award number must be strictly 6 numeric digits.
-    - Cayuse project number must strictly follow YY-XXXX format (auto-formatting 6-digit variants if needed).
-    - Eliminates status words, internal vendor IDs, or misallocated strings.
+    Advanced Defense-in-Depth Identifier Sanitization:
+    - Cross-checks 6-digit 'Oracle' extractions against all discovered YY-XXXX patterns 
+      in the filename and body text to catch stripped hyphens.
+    - Oracle Award Number: MUST be strictly 6 contiguous digits (XXXXXX) that do NOT 
+      map to a hyphenated Cayuse project/proposal number.
+    - Cayuse Project vs Proposal: YY-XXXX format. Evaluates relative chronology 
+      if multiple YY-XXXX patterns appear.
     """
     if not isinstance(idents, dict):
-        return {"oracle_award_number": None, "cayuse_project_number": None, "aln_cfda_number": None, "principal_investigator": None}
+        return {
+            "oracle_award_number": None, 
+            "cayuse_project_number": None, 
+            "cayuse_proposal_number": None, 
+            "aln_cfda_number": None, 
+            "principal_investigator": None
+        }
 
-    orc = str(idents.get("oracle_award_number") or "").strip()
-    cay = str(idents.get("cayuse_project_number") or "").strip()
+    raw_orc = str(idents.get("oracle_award_number") or "").strip()
+    raw_cay = str(idents.get("cayuse_project_number") or "").strip()
+    raw_prop = str(idents.get("cayuse_proposal_number") or "").strip()
 
-    # Strict Oracle Validation: Exactly 6 digits
-    clean_orc = orc if re.match(r'^[1-9]\d{5}$', orc) else None
+    # Search corpus for any hyphenated YY-XXXX patterns
+    search_corpus = f"{raw_cay} {raw_prop} {filename} {body_text[:2000]}"
+    all_yy_xxxx = list(set(re.findall(r'\b(\d{2}-\d{4})\b', search_corpus)))
+    
+    clean_cay = raw_cay if re.match(r'^\d{2}-\d{4}$', raw_cay) else None
+    clean_prop = raw_prop if re.match(r'^\d{2}-\d{4}$', raw_prop) else None
 
-    # Strict Cayuse Validation: YY-XXXX format
-    clean_cay = None
-    if re.match(r'^\d{2}-\d{4}$', cay):
-        clean_cay = cay
-    elif re.match(r'^\d{6}$', cay):
-        clean_cay = f"{cay[:2]}-{cay[2:]}"
+    clean_orc = None
+    if re.match(r'^[1-9]\d{5}$', raw_orc):
+        # Check if this 6-digit string is actually a stripped Cayuse number (e.g. 260802 -> 26-0802)
+        hyphenated_guess = f"{raw_orc[:2]}-{raw_orc[2:]}"
+        if hyphenated_guess in all_yy_xxxx or hyphenated_guess in filename:
+            if not clean_cay:
+                clean_cay = hyphenated_guess
+        else:
+            clean_orc = raw_orc
+    elif re.match(r'^\d{2}-\d{4}$', raw_orc):
+        if not clean_cay:
+            clean_cay = raw_orc
+
+    if len(all_yy_xxxx) >= 2:
+        sorted_yy = sorted(all_yy_xxxx)
+        clean_prop = sorted_yy[0]
+        clean_cay = sorted_yy[-1]
+    elif len(all_yy_xxxx) == 1 and not clean_cay:
+        clean_cay = all_yy_xxxx[0]
 
     return {
         "oracle_award_number": clean_orc,
         "cayuse_project_number": clean_cay,
+        "cayuse_proposal_number": clean_prop,
         "aln_cfda_number": idents.get("aln_cfda_number"),
         "principal_investigator": idents.get("principal_investigator")
     }
-
 
 def parse_ai_header_payload(
     pdf_path: Path, 
@@ -107,6 +134,7 @@ def parse_ai_header_payload(
         "IDENTIFIERS": {
             "oracle_award_number": None,
             "cayuse_project_number": None,
+            "cayuse_proposal_number": None,
             "aln_cfda_number": None,
             "principal_investigator": None
         },
@@ -163,19 +191,34 @@ def parse_ai_header_payload(
     try:
         client = genai.Client(api_key=effective_key)
 
-        # 3. Upload rendered images to Google GenAI storage
+        # 3. Upload rendered images to Google GenAI storage with timeout safeguard
         for path in img_paths:
-            uf = client.files.upload(file=path)
-            uploaded_remote_files.append(uf)
+            try:
+                # Pass explicit http_options timeout to prevent socket hangs during upload
+                uf = client.files.upload(
+                    file=path,
+                    config=types.UploadFileConfig(
+                        http_options={'timeout': 30000} # 30 second upload timeout per image
+                    )
+                )
+                uploaded_remote_files.append(uf)
+            except Exception as upload_err:
+                print(f"[Warning] File upload timed out or failed for {path.name}: {upload_err}")
+                break
+        
+        # If not all pages uploaded successfully due to a timeout, fallback safely
+        if len(uploaded_remote_files) != len(img_paths):
+            raise Exception("Incomplete file uploads due to network timeout.")
 
         # 4. Hardened 4-Page Auditor Prompt with Strict Negative Constraints & Format Boundaries
         prompt = f"""
 You are an expert research administration auditor inspecting up to {len(img_paths)} sequential page image(s) from a grant award PDF.
 
 CRITICAL EXTRACTION RULES & NEGATIVE CONSTRAINTS:
-1. ORACLE AWARD NUMBER: Must be STRICTLY 6 numeric digits (e.g., 238025, 166016). NEVER extract Cayuse project IDs, subcontract numbers, status strings (such as "Active"), or vendor supplier codes here. If a true 6-digit Oracle ID is not explicitly printed, return null.
-2. CAYUSE PROJECT NUMBER: Must strictly follow the format YY-XXXX where YY is a 2-digit year and XXXX is a 4-digit sequence (e.g., 22-0996, 26-0802). NEVER extract vendor ID strings, internal subaward tracking codes, or prime sponsor grant numbers here.
-3. FINANCIAL VECTORS: If this is a non-financial action (such as an NCE without funds, a PI change, or a technical progress report), ALL financial vector amounts MUST be explicitly returned as null, NOT 0.0.
+1. ORACLE AWARD NUMBER: Must be STRICTLY 6 contiguous numeric digits (e.g., 238025, 166016). NEVER extract Cayuse project IDs, proposal numbers, subcontract numbers, status strings (such as "Active"), or vendor supplier codes here. If a true 6-digit Oracle ID is not explicitly printed, return null.
+2. CAYUSE PROJECT NUMBER: Must strictly follow the format YY-XXXX where YY is a 2-digit year and XXXX is a 4-digit sequence separated by a hyphen (e.g., 22-0996, 26-0802). NEVER extract vendor ID strings, internal subaward tracking codes, or prime sponsor grant numbers here.
+3. CAYUSE PROPOSAL NUMBER: If a proposal ID is listed alongside the project ID (in YY-XXXX format), extract it here. Otherwise return null.
+4. FINANCIAL VECTORS: If this is a non-financial action (such as an NCE without funds, a PI change, or a technical progress report), ALL financial vector amounts MUST be explicitly returned as null, NOT 0.0.
 
 Inspect the document pages (headers, notice title blocks, financial summary boxes, and budget tables) and extract the following:
 
@@ -189,8 +232,9 @@ Inspect the document pages (headers, notice title blocks, financial summary boxe
    - is_administrative_non_financial_action: true if this is strictly a non-financial admin change (PI change, address change, NCE without funds); false if it obligates or restates funds.
 
 2. IDENTIFIERS:
-   - oracle_award_number: 6 numeric digits or null.
+   - oracle_award_number: Exactly 6 contiguous digits or null.
    - cayuse_project_number: YY-XXXX format or null.
+   - cayuse_proposal_number: YY-XXXX format or null.
    - aln_cfda_number: Federal CFDA / ALN Number if listed (e.g., 93.286, 47.070).
    - principal_investigator: Lead Principal Investigator name.
 
@@ -226,6 +270,7 @@ Respond STRICTLY with a valid JSON object matching this structure:
   "identifiers": {{
     "oracle_award_number": null,
     "cayuse_project_number": null,
+    "cayuse_proposal_number": null,
     "aln_cfda_number": null,
     "principal_investigator": null
   }},
@@ -265,9 +310,9 @@ Respond STRICTLY with a valid JSON object matching this structure:
 
         raw_json_dict = json.loads(response.text)
 
-        # 6. Sanitize Identifiers via Defense-in-Depth Programmatic Guardrail
+        # 6. Sanitize Identifiers via Defense-in-Depth Programmatic Guardrail & Filename Context
         raw_idents = raw_json_dict.get("identifiers") or {}
-        sanitized_idents = sanitize_ai_identifiers(raw_idents)
+        sanitized_idents = sanitize_ai_identifiers(raw_idents, filename=pdf_path.name)
 
         # 7. Normalize and sanitize JSON fields
         fin = raw_json_dict.get("financial_vector") or {}
