@@ -43,7 +43,7 @@ VISION_API_KEY             = os.getenv("GEMINI_API_KEY") or os.getenv("VISION_AP
 RE_ORACLE_NUM  = re.compile(r'(?<!\d)([1-9]\d{5})(?!\d)')
 RE_CAYUSE_PROJ = re.compile(r'(?<![A-Za-z0-9])(\d{2}-\d{4})(?![A-Za-z0-9])')
 RE_CAYUSE_PROP = re.compile(r'(?<![A-Za-z0-9])(A\d{2}-\d{4})(?![A-Za-z0-9])', re.IGNORECASE)
-RE_BANNER_UID  = re.compile(r'(?<![A-Za-z0-9])(R\d{4,6})(?![A-Za-z0-9])', re.IGNORECASE)
+RE_BANNER_UID = re.compile(r'(?<![A-Za-z0-9])([Rr](?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{5})(?![A-Za-z0-9])')
 RE_ALN         = re.compile(r'(?<!\d)(\d{2}\.\d{3})(?!\d)')
 
 RE_EXECUTION_DATE = re.compile(
